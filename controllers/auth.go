@@ -25,12 +25,33 @@ func generateOTP() string {
 }
 
 func setTokenCookies(c *gin.Context, access, refresh string) {
-	// Access Token: 1 hour (3600 seconds)
-	// Set secure=true và SameSite=None cho production HTTPS
-	c.SetCookie("access_token", access, 3600, "/", "", true, true)
-	// Refresh Token: 7 days (604800 seconds)
+	// Kiểm tra xem có đang chạy ở production không (đơn giản là check domain không phải localhost)
+	// Hoặc dựa vào config nếu có. Ở đây ta ưu tiên Secure=true và SameSite=None cho HTTPS.
+	
+	// Access Token: 15 phút (khớp với JWT)
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "access_token",
+		Value:    access,
+		MaxAge:   900, // 15 phút
+		Path:     "/",
+		Domain:   "",
+		Secure:   true, // Bắt buộc cho SameSite=None
+		HttpOnly: true,
+		SameSite: http.SameSiteNoneMode,
+	})
+
+	// Refresh Token: 7 ngày
 	if refresh != "" {
-		c.SetCookie("refresh_token", refresh, 604800, "/", "", true, true)
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name:     "refresh_token",
+			Value:    refresh,
+			MaxAge:   7 * 24 * 3600,
+			Path:     "/",
+			Domain:   "",
+			Secure:   true,
+			HttpOnly: true,
+			SameSite: http.SameSiteNoneMode,
+		})
 	}
 }
 
@@ -174,8 +195,17 @@ func Refresh(c *gin.Context) {
 
 	access, _, _ := utils.GenerateTokenPair(claims.UserID, claims.Role, claims.Persona)
 
-	// Cập nhật access token mới vào cookie
-	c.SetCookie("access_token", access, 3600, "/", "", false, true)
+	// Cập nhật access token mới vào cookie theo chuẩn Secure/SameSite
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "access_token",
+		Value:    access,
+		MaxAge:   900,
+		Path:     "/",
+		Domain:   "",
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteNoneMode,
+	})
 
 	c.JSON(200, gin.H{
 		"success": true,
@@ -550,8 +580,24 @@ func Logout(c *gin.Context) {
 	}
 
 	// 3. Xóa cookie bằng cách set MaxAge = -1
-	c.SetCookie("access_token", "", -1, "/", "", true, true)
-	c.SetCookie("refresh_token", "", -1, "/", "", true, true)
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "access_token",
+		Value:    "",
+		MaxAge:   -1,
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteNoneMode,
+	})
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "refresh_token",
+		Value:    "",
+		MaxAge:   -1,
+		Path:     "/",
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteNoneMode,
+	})
 
 	c.JSON(200, gin.H{
 		"success": true,
