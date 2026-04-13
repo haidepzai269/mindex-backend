@@ -87,7 +87,7 @@ func main() {
 
 	// 6. Setup CORS chuyên sâu để cho phép Frontend (3000) gọi Backend (8080)
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000"},
+		AllowOrigins:     []string{"http://localhost:3000", "https://mindex.io.vn", "https://mindex-frontend.haidepzai92006.workers.dev"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"},
 		ExposeHeaders:    []string{"Content-Length"},
