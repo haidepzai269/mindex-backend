@@ -1,0 +1,9 @@
+# Backend Go
+.env*
+*.exe
+*.bin
+/tmp
+/.vscode
+/vendor
+/scratch
+/build
