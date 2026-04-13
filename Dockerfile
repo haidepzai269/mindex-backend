@@ -1,5 +1,8 @@
 # Stage 1: Build the Go binary
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25-alpine AS builder
+
+# Set GOTOOLCHAIN to auto to allow downloading newer versions if required by dependencies
+ENV GOTOOLCHAIN=auto
 
 # Install build dependencies
 RUN apk add --no-cache git
