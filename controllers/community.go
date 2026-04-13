@@ -70,11 +70,12 @@ func AddCommunityLibrary(c *gin.Context) {
 			return
 		}
 
-		// ── Kích hoạt share: is_public=TRUE, expired_at=+30 ngày, contributor_id=người thực hiện ──
+		// ── Kích hoạt share: is_public=TRUE, expired_at=+30 ngày, shared_at=NOW(), contributor_id=người thực hiện ──
 		result, err := config.DB.Exec(config.Ctx,
 			`UPDATE documents
 			 SET is_public = TRUE,
 			     expired_at = NOW() + INTERVAL '30 days',
+			     shared_at = NOW(),
 			     contributor_id = $1
 			 WHERE id = $2`,
 			userID, docID)
@@ -93,6 +94,7 @@ func AddCommunityLibrary(c *gin.Context) {
 		// Xóa cache profile để cập nhật quota trong Billing/UI
 		if config.RedisClient != nil {
 			config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID))
+			utils.ClearCommunityCache()
 		}
 
 		c.JSON(200, gin.H{"success": true, "message": "Đã chia sẻ vào Thư viện chung. Tài liệu sẽ tồn tại 30 ngày và được gia hạn khi có tương tác."})
@@ -143,6 +145,7 @@ func AddCommunityLibrary(c *gin.Context) {
 		// Xóa cache profile để cập nhật quota trong Billing/UI
 		if config.RedisClient != nil {
 			config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID))
+			utils.ClearCommunityCache()
 		}
 
 		c.JSON(200, gin.H{"success": true, "message": "Đã rút tài liệu khỏi Thư viện chung"})
@@ -166,10 +169,12 @@ func SearchCommunity(c *gin.Context) {
 	if cachedData := utils.GetCache(resultCacheKey); cachedData != "" {
 		var resp gin.H
 		if err := json.Unmarshal([]byte(cachedData), &resp); err == nil {
-			log.Printf("🚀 [Community] Result Cache Hit: %s", query)
+			log.Printf("🚀 [Community] Result Cache Hit | Key: %s | Query: %s", resultCacheKey, query)
 			c.JSON(200, resp)
 			return
 		}
+	} else {
+		log.Printf("🔍 [Community] Cache Miss | Key: %s | Query: %s", resultCacheKey, query)
 	}
 
 	// Chuẩn hóa query (xóa dấu) để so sánh Keyword Match trong SQL tốt hơn
@@ -258,7 +263,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 			scoring AS (
 				SELECT 
 					d.id, d.title, d.creator_persona, d.query_count, d.upvote_count,
-					d.created_at, d.expired_at, d.user_id AS owner_id,
+					d.created_at, d.expired_at, COALESCE(d.shared_at, d.created_at) AS display_date, d.user_id AS owner_id,
 					COALESCE(uc.name, uo.name) AS contributor_name,
 					(CASE WHEN (REPLACE(LOWER(d.title), '_', ' ') ILIKE '%' || REPLACE(LOWER($2), '_', ' ') || '%') THEN 1.0 ELSE 0 END + 
 					 CASE WHEN ss.max_similarity IS NOT NULL THEN ss.max_similarity ELSE 0 END) as hybrid_score
@@ -283,10 +288,10 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 				id, title, creator_persona, query_count, upvote_count, 
 				created_at, expired_at, owner_id, contributor_name,
 				(SELECT COUNT(*) FROM document_chunks WHERE document_id = s.id) AS chunk_count,
-				hybrid_score
+				hybrid_score, display_date
 			FROM scoring s
 			WHERE hybrid_score > 0
-			ORDER BY hybrid_score DESC, query_count DESC, upvote_count DESC
+			ORDER BY hybrid_score DESC, display_date DESC
 			LIMIT 32`
 
 	} else if query != "" {
@@ -297,7 +302,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 				d.created_at, d.expired_at, d.user_id AS owner_id,
 				COALESCE(uc.name, uo.name) AS contributor_name,
 				(SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) AS chunk_count,
-				0.8 as hybrid_score
+				0.8 as hybrid_score, COALESCE(d.shared_at, d.created_at) AS display_date
 			FROM documents d
 			JOIN users uo ON d.user_id = uo.id
 			LEFT JOIN users uc ON d.contributor_id = uc.id
@@ -312,7 +317,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 			args = append(args, subject)
 		}
 		
-		sqlQuery += " ORDER BY query_count DESC, created_at DESC LIMIT 32"
+		sqlQuery += " ORDER BY display_date DESC LIMIT 32"
 
 	} else {
 		// 3. CHẾ ĐỘ DUYỆT (BROWSE MODE - KHI MỚI VÀO TRANG)
@@ -322,7 +327,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 				d.created_at, d.expired_at, d.user_id AS owner_id,
 				COALESCE(uc.name, uo.name) AS contributor_name,
 				(SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) AS chunk_count,
-				1.0 as hybrid_score
+				1.0 as hybrid_score, COALESCE(d.shared_at, d.created_at) AS display_date
 			FROM documents d
 			JOIN users uo ON d.user_id = uo.id
 			LEFT JOIN users uc ON d.contributor_id = uc.id
@@ -334,7 +339,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 			args = append(args, subject)
 		}
 		
-		sqlQuery += " ORDER BY created_at DESC, query_count DESC LIMIT 32"
+		sqlQuery += " ORDER BY display_date DESC LIMIT 32"
 	}
 
 	rows, err := config.DB.Query(config.Ctx, sqlQuery, args...)
@@ -357,6 +362,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 		ChunkCount      int        `json:"chunk_count"`
 		OwnerID         string     `json:"owner_id"`
 		HybridScore     float64    `json:"hybrid_score"`
+		DisplayDate     time.Time  `json:"display_date"`
 	}
 
 	var results []CommunityDoc
@@ -366,7 +372,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 			&doc.ID, &doc.Title, &doc.CreatorPersona,
 			&doc.QueryCount, &doc.UpvoteCount, &doc.CreatedAt,
 			&doc.ExpiredAt, &doc.OwnerID, &doc.ContributorName, &doc.ChunkCount,
-			&doc.HybridScore,
+			&doc.HybridScore, &doc.DisplayDate,
 		)
 		if err != nil {
 			log.Printf("⚠️ [Community] Scan error: %v", err)
@@ -424,7 +430,7 @@ func GetCommunityDocumentDetail(c *gin.Context) {
 			(SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id)
 		FROM documents d
 		JOIN users u ON d.user_id = u.id
-		WHERE d.id = $1 AND d.is_public = TRUE
+		WHERE d.id = $1
 		  AND (d.expired_at IS NULL OR d.expired_at > NOW())`,
 		docID,
 	).Scan(
@@ -472,7 +478,7 @@ func UseCommunityDocument(c *gin.Context) {
 	// Kiểm tra tài liệu tồn tại và là public
 	var exists bool
 	err := config.DB.QueryRow(config.Ctx,
-		`SELECT EXISTS(SELECT 1 FROM documents WHERE id=$1 AND is_public=TRUE AND status='ready')`,
+		`SELECT EXISTS(SELECT 1 FROM documents WHERE id=$1 AND status='ready')`,
 		docID).Scan(&exists)
 	if err != nil || !exists {
 		c.JSON(404, gin.H{"success": false, "error": "DOCUMENT_NOT_FOUND", "message": "Tài liệu không tồn tại hoặc chưa sẵn sàng"})

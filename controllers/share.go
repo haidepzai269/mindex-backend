@@ -108,6 +108,9 @@ HỘI THOẠI:
 		return
 	}
 
+	// Cập nhật shared_at trong bảng documents để phục vụ sắp xếp (vừa chia sẻ sẽ lên đầu)
+	_, _ = config.DB.Exec(config.Ctx, `UPDATE documents SET shared_at = NOW() WHERE id = $1`, docID)
+
 	log.Printf("✅ [SHARE] Đã tạo shared_link %s cho session %s của doc %s", linkID, req.SessionID, docID)
 
 	c.JSON(201, gin.H{

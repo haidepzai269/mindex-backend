@@ -65,6 +65,9 @@ func ConnectDB() {
 			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='documents' AND column_name='expiration_notified') THEN
 				ALTER TABLE documents ADD COLUMN expiration_notified BOOLEAN NOT NULL DEFAULT FALSE;
 			END IF;
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='documents' AND column_name='shared_at') THEN
+				ALTER TABLE documents ADD COLUMN shared_at TIMESTAMPTZ;
+			END IF;
 
 			-- Bổ sung contributor_id
 			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='documents' AND column_name='contributor_id') THEN

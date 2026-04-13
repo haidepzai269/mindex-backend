@@ -24,10 +24,11 @@ func generateOTP() string {
 
 func setTokenCookies(c *gin.Context, access, refresh string) {
 	// Access Token: 1 hour (3600 seconds)
-	c.SetCookie("access_token", access, 3600, "/", "", false, true)
+	// Set secure=true và SameSite=None cho production HTTPS
+	c.SetCookie("access_token", access, 3600, "/", "", true, true)
 	// Refresh Token: 7 days (604800 seconds)
 	if refresh != "" {
-		c.SetCookie("refresh_token", refresh, 604800, "/", "", false, true)
+		c.SetCookie("refresh_token", refresh, 604800, "/", "", true, true)
 	}
 }
 
@@ -532,13 +533,27 @@ func ResetPassword(c *gin.Context) {
 }
 
 func Logout(c *gin.Context) {
-	// Xóa cookie bằng cách set MaxAge = -1
-	c.SetCookie("access_token", "", -1, "/", "", false, true)
-	c.SetCookie("refresh_token", "", -1, "/", "", false, true)
+	// 1. Phân tích token ID và thời gian hết hạn từ context (set bởi middleware)
+	tokenID := c.GetString("token_id")
+	tokenExp := c.GetInt64("token_exp")
+
+	// 2. Nếu có Redis, đưa token này vào Blacklist cho đến khi nó tự hết hạn
+	if tokenID != "" && config.RedisClient != nil {
+		now := time.Now().Unix()
+		remaining := tokenExp - now
+		if remaining > 0 {
+			// TTL = thời gian còn lại của token + 1 phút trừ hao
+			config.RedisClient.Set(config.Ctx, "blacklist:"+tokenID, "logged_out", time.Duration(remaining+60)*time.Second)
+		}
+	}
+
+	// 3. Xóa cookie bằng cách set MaxAge = -1
+	c.SetCookie("access_token", "", -1, "/", "", true, true)
+	c.SetCookie("refresh_token", "", -1, "/", "", true, true)
 
 	c.JSON(200, gin.H{
 		"success": true,
-		"message": "Đã đăng xuất",
+		"message": "Đã đăng xuất và vô hiệu hóa phiên làm việc",
 	})
 }
 

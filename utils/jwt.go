@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 type JWTClaims struct {
@@ -16,13 +17,15 @@ type JWTClaims struct {
 }
 
 func GenerateTokenPair(userID, role, persona string) (string, string, error) {
-	// Access Token (15 phút)
+	// 1. Access Token (Rút ngắn xuống 15 phút để bảo mật)
+	accessID := uuid.New().String()
 	accessClaims := JWTClaims{
 		UserID:  userID,
 		Role:    role,
 		Persona: persona,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(60 * time.Minute)),
+			ID:        accessID,
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	}
@@ -32,12 +35,14 @@ func GenerateTokenPair(userID, role, persona string) (string, string, error) {
 		return "", "", err
 	}
 
-	// Refresh Token (7 ngày)
+	// 2. Refresh Token (Giữ nguyên 7 ngày)
+	refreshID := uuid.New().String()
 	refreshClaims := JWTClaims{
 		UserID:  userID,
 		Role:    role,
 		Persona: persona,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        refreshID,
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},

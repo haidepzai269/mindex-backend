@@ -15,6 +15,7 @@ type DocumentItem struct {
 	Title      string     `json:"title"`
 	Status     string     `json:"status"`
 	CreatedAt  time.Time  `json:"created_at"`
+	SharedAt   *time.Time `json:"shared_at"`
 	ExpiredAt  *time.Time `json:"expired_at"`
 	Pinned     bool       `json:"pinned"`
 	IsPublic   bool       `json:"is_public"`
@@ -26,12 +27,12 @@ func GetMyDocuments(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	rows, err := config.DB.Query(config.Ctx, `
-		SELECT d.id, d.title, d.status, d.created_at, d.expired_at, dr.pinned, d.is_public,
+		SELECT d.id, d.title, d.status, d.created_at, d.shared_at, d.expired_at, dr.pinned, d.is_public,
 		       (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) as chunk_count
 		FROM documents d
 		JOIN document_references dr ON d.id = dr.document_id
 		WHERE dr.user_id = $1
-		ORDER BY d.created_at DESC`,
+		ORDER BY COALESCE(d.shared_at, d.created_at) DESC, d.created_at DESC`,
 		userID,
 	)
 	if err != nil {
@@ -50,6 +51,7 @@ func GetMyDocuments(c *gin.Context) {
 			&d.Title, 
 			&d.Status, 
 			&d.CreatedAt, 
+			&d.SharedAt,
 			&d.ExpiredAt, 
 			&d.Pinned, 
 			&d.IsPublic,
@@ -102,11 +104,11 @@ func GetDocumentDetail(c *gin.Context) {
 
 	var d DocumentItem
 	err := config.DB.QueryRow(config.Ctx, `
-		SELECT d.id, d.title, d.status, d.created_at, d.expired_at, dr.pinned, d.is_public,
+		SELECT d.id, d.title, d.status, d.created_at, d.shared_at, d.expired_at, COALESCE(dr.pinned, FALSE), d.is_public,
 		       (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) as chunk_count
 		FROM documents d
-		JOIN document_references dr ON d.id = dr.document_id
-		WHERE d.id = $1 AND dr.user_id = $2
+		LEFT JOIN document_references dr ON d.id = dr.document_id AND dr.user_id = $2
+		WHERE d.id = $1
 		  AND (d.expired_at IS NULL OR d.expired_at > NOW())`,
 		docID, userID,
 	).Scan(
@@ -114,6 +116,7 @@ func GetDocumentDetail(c *gin.Context) {
 		&d.Title, 
 		&d.Status, 
 		&d.CreatedAt, 
+		&d.SharedAt,
 		&d.ExpiredAt, 
 		&d.Pinned, 
 		&d.IsPublic,
@@ -281,6 +284,7 @@ func DeleteDocument(c *gin.Context) {
 	// 5. Xóa cache và gửi thông báo realtime
 	if config.RedisClient != nil {
 		config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID))
+		utils.ClearCommunityCache()
 	}
 	_ = utils.PublishNotification(userID, "quota_update", "Cập nhật dữ liệu", "Tài liệu đã được xóa", nil)
 
@@ -322,5 +326,6 @@ func UpdateDocumentPersona(c *gin.Context) {
 		return
 	}
 
+	utils.ClearCommunityCache()
 	c.JSON(200, gin.H{"success": true, "message": "Đã cập nhật lĩnh vực tài liệu"})
 }

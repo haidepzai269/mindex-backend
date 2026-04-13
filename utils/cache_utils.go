@@ -4,6 +4,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"mindex-backend/config"
 	"strings"
 	"time"
@@ -42,4 +43,37 @@ func SetCache(key string, value string, expiration time.Duration) {
 		return
 	}
 	config.RedisClient.Set(config.Ctx, key, value, expiration)
+}
+
+// ClearCommunityCache xóa toàn bộ cache kết quả tìm kiếm/duyệt của Community
+func ClearCommunityCache() {
+	if config.RedisClient == nil {
+		return
+	}
+	
+	// Sử dụng SCAN để tìm các key có prefix cụ thể và xóa chúng
+	// Key format: cache:community:results:*
+	ctx := config.Ctx
+	var cursor uint64
+	var keys []string
+	var err error
+
+	for {
+		keys, cursor, err = config.RedisClient.Scan(ctx, cursor, "cache:community:*", 100).Result()
+		if err != nil {
+			log.Printf("⚠️ [Cache] Lỗi SCAN community cache: %v", err)
+			break
+		}
+
+		if len(keys) > 0 {
+			log.Printf("🧹 [Cache] Đang xóa %d keys community: %v", len(keys), keys)
+			config.RedisClient.Del(ctx, keys...)
+		}
+
+		if cursor == 0 {
+			break
+		}
+	}
+	
+	log.Printf("🧹 [Cache] Đã hoàn tất làm mới Community Library cache")
 }

@@ -163,6 +163,9 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 		UPDATE documents SET status='ready', file_hash=$1, cloudinary_url=NULL WHERE id=$2`,
 		hash, job.DocID)
 
+	// Làm mới cache cộng đồng (đảm bảo nếu doc đã được share thì sẽ hiện lên search ngay)
+	utils.ClearCommunityCache()
+
 	_, _ = config.DB.Exec(config.Ctx, `
 		INSERT INTO document_references (user_id, document_id, is_owner, pinned)
 		VALUES ($1, $2, TRUE, FALSE) ON CONFLICT DO NOTHING`,
