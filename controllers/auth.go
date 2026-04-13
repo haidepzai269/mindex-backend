@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"crypto/rand"
+	"io/ioutil"
 	"math/big"
+	"net/http"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/api/idtoken"
@@ -569,24 +571,51 @@ func GoogleLogin(c *gin.Context) {
 		return
 	}
 
-	// 1. Xác thực ID Token với Google
+	// 1. Thử xác thực ID Token với Google trước
 	clientID := config.Env.GoogleClientID
 	if clientID == "" {
 		clientID = "610711552000-nlnnovm60gf63bscps5tklsjbub8pdv6.apps.googleusercontent.com"
 	}
 
+	var email, name, googleID, avatarURL string
 	payload, err := idtoken.Validate(config.Ctx, req.Token, clientID)
-	if err != nil {
-		c.JSON(401, gin.H{"success": false, "error": "INVALID_TOKEN", "message": "Token Google không hợp lệ hoặc đã hết hạn"})
-		return
-	}
 
-	email := payload.Claims["email"].(string)
-	name := payload.Claims["name"].(string)
-	googleID := payload.Subject
-	avatarURL := ""
-	if picture, ok := payload.Claims["picture"].(string); ok {
-		avatarURL = picture
+	if err != nil {
+		// FALLBACK: Thử coi req.Token là Access Token và gọi UserInfo API
+		resp, httpErr := http.Get("https://www.googleapis.com/oauth2/v3/userinfo?access_token=" + req.Token)
+		if httpErr != nil || resp.StatusCode != 200 {
+			c.JSON(401, gin.H{"success": false, "error": "INVALID_TOKEN", "message": "Token Google không hợp lệ hoặc đã hết hạn"})
+			return
+		}
+		defer resp.Body.Close()
+		body, _ := ioutil.ReadAll(resp.Body)
+		var userInfo map[string]interface{}
+		if err := json.Unmarshal(body, &userInfo); err != nil {
+			c.JSON(500, gin.H{"success": false, "message": "Lỗi xử lý dữ liệu Google"})
+			return
+		}
+
+		email, _ = userInfo["email"].(string)
+		name, _ = userInfo["name"].(string)
+		googleID, _ = userInfo["sub"].(string)
+		
+		if email == "" || googleID == "" {
+			fmt.Printf("[Google Auth Error] Missing required fields: email=%s, sub=%s\n", email, googleID)
+			c.JSON(401, gin.H{"success": false, "error": "INVALID_TOKEN", "message": "Thông tin từ Google không đầy đủ"})
+			return
+		}
+
+		if picture, ok := userInfo["picture"].(string); ok {
+			avatarURL = picture
+		}
+	} else {
+		// SUCCESS: Dùng thông tin từ ID Token
+		email = payload.Claims["email"].(string)
+		name = payload.Claims["name"].(string)
+		googleID = payload.Subject
+		if picture, ok := payload.Claims["picture"].(string); ok {
+			avatarURL = picture
+		}
 	}
 
 	// 2. Tìm user trong DB
