@@ -85,6 +85,10 @@ func main() {
 	// 5. Init router
 	r := gin.Default()
 
+	r.GET("/ping", func(c *gin.Context) {
+		c.JSON(200, gin.H{"message": "pong"})
+	})
+
 	// 6. Setup CORS chuyên sâu để cho phép Frontend (3000) gọi Backend (8080)
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"http://localhost:3000", "https://mindex.io.vn", "https://mindex-frontend.haidepzai92006.workers.dev"},
@@ -100,6 +104,10 @@ func main() {
 	{
 		api.GET("/health", func(c *gin.Context) {
 			c.JSON(200, gin.H{"status": "ok", "message": "Mindex API Server is running!"})
+		})
+
+		api.GET("/ping", func(c *gin.Context) {
+			c.JSON(200, gin.H{"message": "pong"})
 		})
 
 		routes.RegisterAuthRoutes(api)
