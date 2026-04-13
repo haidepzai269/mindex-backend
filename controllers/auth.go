@@ -83,6 +83,8 @@ func Register(c *gin.Context) {
 	c.JSON(201, gin.H{
 		"success": true,
 		"data": gin.H{
+			"access_token":     access,
+			"refresh_token":    refresh,
 			"user_id":          userID,
 			"email":            req.Email,
 			"name":             req.Name,
@@ -123,6 +125,8 @@ func Login(c *gin.Context) {
 	c.JSON(200, gin.H{
 		"success": true,
 		"data": gin.H{
+			"access_token":  access,
+			"refresh_token": refresh,
 			"user": gin.H{
 				"id":         user.ID,
 				"name":       user.Name,
@@ -629,6 +633,8 @@ func GoogleLogin(c *gin.Context) {
 	c.JSON(200, gin.H{
 		"success": true,
 		"data": gin.H{
+			"access_token":  access,
+			"refresh_token": refresh,
 			"user": gin.H{
 				"id":         user.ID,
 				"name":       user.Name,
