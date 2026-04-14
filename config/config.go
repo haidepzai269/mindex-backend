@@ -27,6 +27,7 @@ type AppConfig struct {
 	SMTPPass         string
 	SMTPFrom         string
 	GoogleClientID   string
+	RedisQueueName   string
 }
 
 var Env AppConfig
@@ -123,5 +124,11 @@ func LoadConfig() {
 		SMTPPass:         os.Getenv("SMTP_PASS"),
 		SMTPFrom:         os.Getenv("SMTP_FROM_EMAIL"),
 		GoogleClientID:   os.Getenv("GOOGLE_CLIENT_ID"),
+		RedisQueueName:   func() string {
+			if q := os.Getenv("REDIS_QUEUE_NAME"); q != "" {
+				return q
+			}
+			return "upload_queue"
+		}(),
 	}
 }

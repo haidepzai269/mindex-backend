@@ -27,8 +27,8 @@ func runWorker() {
 			continue
 		}
 
-		// BLPOP block indefinitely until a new job is pushed to "upload_queue"
-		result, err := config.RedisClient.BLPop(context.Background(), 0, "upload_queue").Result()
+		// BLPOP block indefinitely until a new job is pushed to the configured queue
+		result, err := config.RedisClient.BLPop(context.Background(), 0, config.Env.RedisQueueName).Result()
 		if err != nil {
 			log.Println(" Worker queue pop error:", err)
 			time.Sleep(2 * time.Second) // Giảm tải nếu kết nối đứt

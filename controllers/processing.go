@@ -157,7 +157,7 @@ func InitiateUpload(c *gin.Context) {
 	}
 	payload, _ := json.Marshal(job)
 
-	err = config.RedisClient.LPush(config.Ctx, "upload_queue", payload).Err()
+	err = config.RedisClient.LPush(config.Ctx, config.Env.RedisQueueName, payload).Err()
 	if err != nil {
 		config.DB.Exec(config.Ctx, `UPDATE documents SET status='error' WHERE id=$1`, docID)
 		c.JSON(500, gin.H{"success": false, "message": "Lỗi hệ thống hàng đợi"})

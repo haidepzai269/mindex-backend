@@ -71,7 +71,7 @@ def extract_pdf(path: str) -> list[Block]:
 
     with pdfplumber.open(path) as pdf:
         for page_num, page in enumerate(pdf.pages, 1):
-            words = page.extract_words(extra_attrs=["size", "fontname", "flags"])
+            words = page.extract_words(extra_attrs=["size", "fontname"])
             if not words:
                 # Textless page (either image or empty)
                 continue
