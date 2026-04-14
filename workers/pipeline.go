@@ -98,13 +98,14 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 
 	for i, chunkObj := range chunks {
 		wg.Add(1)
-		go func(idx int, content string) {
+		go func(idx int, c utils.Chunk) {
 			defer wg.Done()
 			embedSemaphore <- struct{}{}
 			defer func() { <-embedSemaphore }()
 
 			start := time.Now()
-			vec, err := utils.GeminiEmbedPool.EmbedWithRetry(content, utils.CallGeminiAPI)
+			// GeminiEmbedPool chỉ nhận Content sạch (không có breadcrumb/overlap dư thừa)
+			vec, err := utils.GeminiEmbedPool.EmbedWithRetry(c.Content, utils.CallGeminiAPI)
 			latency := int(time.Since(start).Milliseconds())
 			
 			if err != nil {
@@ -117,7 +118,7 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 					DocumentID:  &job.DocID,
 					Service:     "gemini_embed",
 					Operation:   "upload",
-					TotalTokens: len(content) / 4,
+					TotalTokens: len(c.Content) / 4,
 					LatencyMs:   latency,
 					Status:      "error",
 					ErrorCode:   err.Error(),
@@ -131,7 +132,7 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 				DocumentID:  &job.DocID,
 				Service:     "gemini_embed",
 				Operation:   "upload",
-				TotalTokens: len(content) / 4,
+				TotalTokens: len(c.Content) / 4,
 				LatencyMs:   latency,
 				Status:      "ok",
 			})
@@ -142,15 +143,15 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 
 			vecStr := utils.FloatSliceToVectorString(vec)
 			_, err = config.DB.Exec(config.Ctx, `
-				INSERT INTO document_chunks (document_id, chunk_index, content, embedding, token_count)
-				VALUES ($1, $2, $3, $4::vector, $5)`,
-				job.DocID, idx, content, vecStr, len(content)/4,
+				INSERT INTO document_chunks (document_id, chunk_index, content, retrieval_content, embedding, token_count)
+				VALUES ($1, $2, $3, $4, $5::vector, $6)`,
+				job.DocID, idx, c.Content, c.RetrievalContent, vecStr, len(c.Content)/4,
 			)
 			if err != nil {
 				atomic.AddInt32(&errCount, 1)
 				log.Printf("❌ [DB Error] Doc %s Chunk %d: %v", job.DocID, idx, err)
 			}
-		}(i, chunkObj.Content)
+		}(i, chunkObj)
 	}
 	wg.Wait()
 

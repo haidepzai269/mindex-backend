@@ -18,11 +18,12 @@ type Block struct {
 }
 
 type Chunk struct {
-	Content    string
-	Heading    string
-	TokenCount int
-	PageStart  int
-	ChunkIndex int
+	Content          string // Nội dung dùng cho Embedding (Sạch)
+	RetrievalContent string // Nội dung trả về cho LLM (Có Breadcrumb, Overlap)
+	Heading          string
+	TokenCount       int
+	PageStart        int
+	ChunkIndex       int
 }
 
 const (
@@ -102,6 +103,7 @@ func extractBlocks(filePath string) ([]Block, error) {
 func buildChunks(blocks []Block) []Chunk {
 	var chunks []Chunk
 	var current strings.Builder
+	var currentOverlap string
 	currentTokens := 0
 	
 	// Breadcrumb logic variables
@@ -112,15 +114,16 @@ func buildChunks(blocks []Block) []Chunk {
 	chunkIdx := 0
 
 	updateBreadcrumb := func(typ, content string) {
+		short := shortenBreadcrumb(content)
 		switch typ {
 		case "heading1":
-			h1 = content
+			h1 = short
 			h2, h3 = "", ""
 		case "heading2":
-			h2 = content
+			h2 = short
 			h3 = ""
 		case "heading3":
-			h3 = content
+			h3 = short
 		}
 		
 		var parts []string
@@ -139,30 +142,28 @@ func buildChunks(blocks []Block) []Chunk {
 		if current.Len() == 0 {
 			return
 		}
-		content := strings.TrimSpace(current.String())
-		if content == "" {
+		cleanContent := strings.TrimSpace(current.String())
+		if cleanContent == "" {
 			return
 		}
 		
-		finalContent := content
-		// Prepend Breadcrumb Heading
-		if currentHeading != "" {
-			finalContent = currentHeading + "\n\n" + content
-		}
+		retrievalContent := buildRetrievalContent(currentHeading, currentOverlap, cleanContent)
 
 		chunks = append(chunks, Chunk{
-			Content:    finalContent,
-			Heading:    currentHeading,
-			TokenCount: estimateTokens(finalContent),
-			PageStart:  currentPage,
-			ChunkIndex: chunkIdx,
+			Content:          cleanContent,
+			RetrievalContent: retrievalContent,
+			Heading:          currentHeading,
+			TokenCount:       estimateTokens(cleanContent), // Embedding dựa trên nội dung sạch
+			PageStart:        currentPage,
+			ChunkIndex:       chunkIdx,
 		})
 		chunkIdx++
 		current.Reset()
 		currentTokens = 0
+		currentOverlap = "" // Reset overlap after flush
 	}
 
-	for _, block := range blocks {
+	for i, block := range blocks {
 		if block.Content == "" { continue }
 		tokens := estimateTokens(block.Content)
 
@@ -211,10 +212,15 @@ func buildChunks(blocks []Block) []Chunk {
 				flush()
 				currentPage = block.Page
 				if len(chunks) > 0 {
-					overlap := getLastSentences(chunks[len(chunks)-1].Content, OverlapSentences)
-					if overlap != "" {
-						current.WriteString(overlap + "\n\n")
-						currentTokens += estimateTokens(overlap)
+					var prevContent string
+					if i > 0 {
+						prevContent = blocks[i-1].Content
+					}
+					if needsOverlap(block.Type, prevContent) {
+						overlap := getLastSentences(chunks[len(chunks)-1].Content, OverlapSentences)
+						if overlap != "" {
+							currentOverlap = "..." + overlap // Dùng cho RetrievalContent
+						}
 					}
 				}
 			}
@@ -306,9 +312,10 @@ func fallbackToStandardSplit(text string) []Chunk {
 	var finalChunks []Chunk
 	for i, c := range textChunks {
 		finalChunks = append(finalChunks, Chunk{
-			Content: c,
-			TokenCount: estimateTokens(c),
-			ChunkIndex: i,
+			Content:          c,
+			RetrievalContent: c,
+			TokenCount:       estimateTokens(c),
+			ChunkIndex:       i,
 		})
 	}
 	return finalChunks
@@ -356,4 +363,57 @@ func isUpperVietnamese(r rune) bool {
 func min(a, b int) int {
 	if a < b { return a }
 	return b
+}
+
+func shortenBreadcrumb(content string) string {
+	// 1. Remove numbering prefixes (e.g., "1.2.3 Section Name" -> "Section Name")
+	content = strings.TrimSpace(content)
+	words := strings.Fields(content)
+	if len(words) == 0 {
+		return ""
+	}
+
+	// Check if the first word is a numbering (e.g., "1.", "1.2", "1.2.3")
+	firstWord := words[0]
+	isNumbering := true
+	for _, r := range firstWord {
+		if (r < '0' || r > '9') && r != '.' {
+			isNumbering = false
+			break
+		}
+	}
+
+	if isNumbering && len(words) > 1 {
+		words = words[1:]
+	}
+
+	// 2. Keep max 4 important keywords
+	if len(words) > 4 {
+		words = words[:4]
+	}
+
+	return strings.Join(words, " ")
+}
+
+func needsOverlap(currentBlockType string, prevBlockContent string) bool {
+	// Skip overlap if current block is a heading or if previous block ended with a heading mark
+	if strings.HasPrefix(currentBlockType, "heading") {
+		return false
+	}
+	if strings.HasSuffix(strings.TrimSpace(prevBlockContent), "#") {
+		return false
+	}
+	return true
+}
+
+func buildRetrievalContent(breadcrumb string, overlap string, content string) string {
+	var parts []string
+	if breadcrumb != "" {
+		parts = append(parts, breadcrumb)
+	}
+	if overlap != "" {
+		parts = append(parts, overlap)
+	}
+	parts = append(parts, content)
+	return strings.Join(parts, "\n\n")
 }

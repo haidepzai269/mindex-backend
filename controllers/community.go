@@ -446,7 +446,7 @@ func GetCommunityDocumentDetail(c *gin.Context) {
 	// Lấy preview: ghép nội dung vài chunk đầu tiên (~500 từ)
 	var previewBuilder strings.Builder
 	previewRows, _ := config.DB.Query(config.Ctx,
-		`SELECT content FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index ASC LIMIT 3`,
+		`SELECT COALESCE(retrieval_content, content) FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index ASC LIMIT 3`,
 		docID)
 	if previewRows != nil {
 		defer previewRows.Close()

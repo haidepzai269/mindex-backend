@@ -322,7 +322,7 @@ func runParallelMap(chunks []string, batchSize int) []string {
 }
 
 func getAllDocumentText(docID string, limit int) string {
-	q := `SELECT content FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index ASC`
+	q := `SELECT COALESCE(retrieval_content, content) FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index ASC`
 	if limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -339,7 +339,7 @@ func getAllDocumentText(docID string, limit int) string {
 }
 
 func getAllDocumentChunks(docID string) []string {
-	rows, _ := config.DB.Query(config.Ctx, `SELECT content FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index ASC`, docID)
+	rows, _ := config.DB.Query(config.Ctx, `SELECT COALESCE(retrieval_content, content) FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index ASC`, docID)
 	defer rows.Close()
 
 	var chunks []string
