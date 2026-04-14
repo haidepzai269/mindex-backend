@@ -59,7 +59,7 @@ func InitOrchestrator() {
 	// 1. CHAT (RAG)
 	AI.Priorities[ServiceChat] = []AIProviderConfig{
 		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
-		{Type: ProviderCerebras, Model: "gpt-oss-120b", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
+		{Type: ProviderCerebras, Model: "qwen-3-235b-a22b-instruct-2507", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
 		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
 		{Type: ProviderOpenRouter, Model: "google/gemini-2.0-flash-exp:free", Pool: OpenRouterPool, IsOpenAI: true, BaseURL: "https://openrouter.ai/api/v1"},
 	}
@@ -75,7 +75,7 @@ func InitOrchestrator() {
 	// 3. PHÂN LOẠI (CLASSIFY)
 	AI.Priorities[ServiceClassify] = []AIProviderConfig{
 		{Type: ProviderGemini, Model: "gemini-2.5-flash-lite", Pool: GeminiChatPool, IsOpenAI: false},
-		{Type: ProviderCerebras, Model: "gpt-oss-120b", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
+		{Type: ProviderCerebras, Model: "qwen-3-235b-a22b-instruct-2507", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
 		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
 		{Type: ProviderHF, Model: "facebook/bart-large-mnli", Pool: HFPool, IsOpenAI: false},
 	}
