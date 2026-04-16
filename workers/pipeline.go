@@ -52,6 +52,13 @@ func RunEmbeddingPipeline(job controllers.UploadJob) error {
 	cleanText := cleanTextBuilder.String()
 	log.Printf("📄 Extracted %d chunks from Doc %s", len(chunks), job.DocID)
 
+	// 3a. Document Intelligence (Nghiên cứu tài liệu toàn diện)
+	utils.UpdateDocProgress(job.DocID, "analyzing", 35)
+	docIntel, intelErr := utils.AnalyzeDocument(job.DocID, cleanText)
+	if intelErr != nil {
+		log.Printf("⚠️ [Pipeline Warning] Doc Intelligence failed for %s: %v. Continuing without big picture metadata.", job.DocID, intelErr)
+	}
+
 	// Kiểm duyệt
 	utils.UpdateDocProgress(job.DocID, "moderating", 40)
 	if passed, reason := utils.T1RuleBased(config.Ctx, hash, len(strings.Fields(cleanText)), len(cleanText), cleanText); !passed {
@@ -75,7 +82,13 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 
 	classifyMessages := []utils.ChatMessage{
 		{Role: "system", Content: classifySystemPrompt},
-		{Role: "user", Content: fmt.Sprintf("Hãy phân loại tài liệu sau đây thành một Persona duy nhất:\n\n%s", func() string { if len(cleanText) > 2000 { return cleanText[:2000] }; return cleanText }())},
+		{Role: "user", Content: fmt.Sprintf("Hãy phân loại tài liệu sau đây thành một Persona duy nhất:\n\n%s", func() string {
+			runes := []rune(cleanText)
+			if len(runes) > 2000 {
+				return string(runes[:2000])
+			}
+			return cleanText
+		}())},
 	}
 	
 	detectedPersona, usedProvider, err := utils.AI.ChatNonStream(utils.ServiceClassify, classifyMessages)
@@ -104,8 +117,21 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 			defer func() { <-embedSemaphore }()
 
 			start := time.Now()
-			// GeminiEmbedPool chỉ nhận Content sạch (không có breadcrumb/overlap dư thừa)
-			vec, err := utils.GeminiEmbedPool.EmbedWithRetry(c.Content, utils.CallGeminiAPI)
+
+			// --- CẢI TIẾN: Contextual Enrichment ---
+			// Chỉ làm giàu nếu có Doc Intelligence (cần tóm tắt/chủ đề chính)
+			finalContent := c.Content
+			if docIntel != nil {
+				enriched, encErr := utils.EnrichChunk(c.Content, docIntel.MainTopic)
+				if encErr == nil {
+					finalContent = enriched
+				} else {
+					log.Printf("⚠️ [Enrich Error] Chunk %d in %s: %v", idx, job.DocID, encErr)
+				}
+			}
+
+			// GeminiEmbedPool nhận nội dung đã được làm giàu (Enriched)
+			vec, err := utils.GeminiEmbedPool.EmbedWithRetry(finalContent, utils.CallGeminiAPI)
 			latency := int(time.Since(start).Milliseconds())
 			
 			if err != nil {
@@ -143,9 +169,9 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 
 			vecStr := utils.FloatSliceToVectorString(vec)
 			_, err = config.DB.Exec(config.Ctx, `
-				INSERT INTO document_chunks (document_id, chunk_index, content, retrieval_content, embedding, token_count)
-				VALUES ($1, $2, $3, $4, $5::vector, $6)`,
-				job.DocID, idx, c.Content, c.RetrievalContent, vecStr, len(c.Content)/4,
+				INSERT INTO document_chunks (document_id, chunk_index, content, retrieval_content, embedding, token_count, page_number)
+				VALUES ($1, $2, $3, $4, $5::vector, $6, $7)`,
+				job.DocID, idx, finalContent, c.RetrievalContent, vecStr, len(finalContent)/4, c.PageStart,
 			)
 			if err != nil {
 				atomic.AddInt32(&errCount, 1)

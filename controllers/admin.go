@@ -144,8 +144,8 @@ func AdminListChats(c *gin.Context) {
 
 	query := `
 		SELECT 
-			ch.id, ch.session_id, u.email as user_email, d.title as doc_title,
-			ch.message_count, ch.summary, ch.flagged, ch.flag_reason, ch.started_at
+			ch.id, ch.session_id, u.email as user_email, COALESCE(d.title, '') as doc_title,
+			ch.message_count, COALESCE(ch.summary, '') as summary, ch.flagged, COALESCE(ch.flag_reason, ''), ch.started_at
 		FROM chat_histories ch
 		JOIN users u ON u.id = ch.user_id
 		LEFT JOIN documents d ON d.id = ch.document_id
@@ -167,32 +167,21 @@ func AdminListChats(c *gin.Context) {
 
 	var chats []gin.H
 	for rows.Next() {
-		var id, sid, email, summary string
-		var docTitle *string
+		var id, sid, email, summary, docTitle, flagReason string
 		var count int
 		var flag bool
-		var flagReason *string
 		var startedAt time.Time
 		rows.Scan(&id, &sid, &email, &docTitle, &count, &summary, &flag, &flagReason, &startedAt)
-
-		dt := ""
-		if docTitle != nil {
-			dt = *docTitle
-		}
-		fr := ""
-		if flagReason != nil {
-			fr = *flagReason
-		}
 
 		chats = append(chats, gin.H{
 			"id":            id,
 			"session_id":    sid,
 			"user_email":    email,
-			"doc_title":     dt,
+			"doc_title":     docTitle,
 			"message_count": count,
 			"summary":       summary,
 			"flagged":       flag,
-			"flag_reason":   fr,
+			"flag_reason":   flagReason,
 			"started_at":    startedAt,
 		})
 	}
@@ -216,12 +205,12 @@ func AdminGetChatDetail(c *gin.Context) {
 		Summary       string          `json:"summary"`
 		FullMessages  json.RawMessage `json:"messages"`
 		Flagged       bool            `json:"flagged"`
-		FlagReason    *string         `json:"flag_reason"`
+		FlagReason    string          `json:"flag_reason"`
 		StartedAt     time.Time       `json:"started_at"`
 	}
 
 	err := config.DB.QueryRow(config.Ctx, `
-		SELECT ch.id, u.email, ch.summary, ch.full_messages, ch.flagged, ch.flag_reason, ch.started_at
+		SELECT ch.id, u.email, COALESCE(ch.summary, ''), ch.full_messages, ch.flagged, COALESCE(ch.flag_reason, ''), ch.started_at
 		FROM chat_histories ch
 		JOIN users u ON u.id = ch.user_id
 		WHERE ch.session_id = $1`, sessionID).Scan(

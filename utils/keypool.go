@@ -40,6 +40,8 @@ var (
 	MistralPool     *ApiKeyPool
 	OpenRouterPool  *ApiKeyPool
 	HFPool          *ApiKeyPool
+	NineRouterPool  *ApiKeyPool
+	NineRouterChatPool *ApiKeyPool
 )
 
 // NewApiKeyPool khởi tạo một pool cụ thể

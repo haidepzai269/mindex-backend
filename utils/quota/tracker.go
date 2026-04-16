@@ -21,6 +21,7 @@ const (
 	ProviderMistral     = "mistral"
 	ProviderOpenRouter  = "openrouter"
 	ProviderHuggingFace = "huggingface"
+	ProviderNineRouter  = "ninerouter"
 )
 
 // Gemini Model Limits (Dựa trên ảnh Google AI Studio của người dùng)

@@ -59,14 +59,14 @@ func GeminiChatNonStreamWithModel(messages []ChatMessage, modelID string) (strin
 				}
 				genaiMsgs = append(genaiMsgs, &genai.Content{
 					Role:  role,
-					Parts: []genai.Part{genai.Text(m.Content)},
+					Parts: []genai.Part{genai.Text(strings.ToValidUTF8(m.Content, ""))},
 				})
 			}
 		}
 
 		if systemPrompt != "" {
 			model.SystemInstruction = &genai.Content{
-				Parts: []genai.Part{genai.Text(systemPrompt)},
+				Parts: []genai.Part{genai.Text(strings.ToValidUTF8(systemPrompt, ""))},
 			}
 		}
 
@@ -161,14 +161,14 @@ func StreamGeminiChatWithModel(c *gin.Context, messages []ChatMessage, modelID s
 				}
 				genaiMsgs = append(genaiMsgs, &genai.Content{
 					Role:  role,
-					Parts: []genai.Part{genai.Text(m.Content)},
+					Parts: []genai.Part{genai.Text(strings.ToValidUTF8(m.Content, ""))},
 				})
 			}
 		}
 
 		if systemPrompt != "" {
 			model.SystemInstruction = &genai.Content{
-				Parts: []genai.Part{genai.Text(systemPrompt)},
+				Parts: []genai.Part{genai.Text(strings.ToValidUTF8(systemPrompt, ""))},
 			}
 		}
 

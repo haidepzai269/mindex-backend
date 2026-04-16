@@ -16,9 +16,18 @@ import (
 
 // StreamOpenAIChat là adapter chung cho các provider dùng chuẩn OpenAI (Groq, Cerebras, Mistral, OpenRouter)
 func StreamOpenAIChat(c *gin.Context, cfg AIProviderConfig, messages []ChatMessage) (string, error) {
+	// Làm sạch UTF-8 cho messages
+	sanitizedMessages := make([]ChatMessage, len(messages))
+	for i, m := range messages {
+		sanitizedMessages[i] = ChatMessage{
+			Role:    m.Role,
+			Content: strings.ToValidUTF8(m.Content, ""),
+		}
+	}
+
 	reqBody := map[string]interface{}{
 		"model":    cfg.Model,
-		"messages": messages,
+		"messages": sanitizedMessages,
 		"stream":   true,
 	}
 
@@ -39,7 +48,7 @@ func StreamOpenAIChat(c *gin.Context, cfg AIProviderConfig, messages []ChatMessa
 
 	log.Printf("🚀 %s Stream: Khởi tạo với %s cho model %s", cfg.Type, alias, cfg.Model)
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -97,9 +106,18 @@ func StreamOpenAIChat(c *gin.Context, cfg AIProviderConfig, messages []ChatMessa
 
 // ChatOpenAINonStream là adapter gọi chat không stream
 func ChatOpenAINonStream(cfg AIProviderConfig, messages []ChatMessage) (string, error) {
+	// Làm sạch UTF-8 cho messages
+	sanitizedMessages := make([]ChatMessage, len(messages))
+	for i, m := range messages {
+		sanitizedMessages[i] = ChatMessage{
+			Role:    m.Role,
+			Content: strings.ToValidUTF8(m.Content, ""),
+		}
+	}
+
 	reqBody := map[string]interface{}{
 		"model":    cfg.Model,
-		"messages": messages,
+		"messages": sanitizedMessages,
 		"stream":   false,
 	}
 
@@ -120,7 +138,7 @@ func ChatOpenAINonStream(cfg AIProviderConfig, messages []ChatMessage) (string, 
 
 	log.Printf("🤖 %s Non-Stream: Sử dụng %s cho model %s", cfg.Type, alias, cfg.Model)
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err

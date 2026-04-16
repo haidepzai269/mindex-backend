@@ -28,6 +28,11 @@ type AppConfig struct {
 	SMTPFrom         string
 	GoogleClientID   string
 	RedisQueueName   string
+	NineRouterKeys   []string
+	NineRouterBaseURL string
+	NineRouterModel  string
+	NineRouterChatKeys []string
+	NineRouterChatModel string
 }
 
 var Env AppConfig
@@ -104,6 +109,24 @@ func LoadConfig() {
 	if openRouterKeysRaw != "" {
 		openRouterKeys = strings.Split(openRouterKeysRaw, ",")
 	}
+	
+	nineRouterKeysRaw := os.Getenv("NINEROUTER_API_KEYS")
+	var nineRouterKeys []string
+	if nineRouterKeysRaw != "" {
+		parts := strings.Split(nineRouterKeysRaw, ",")
+		for _, v := range parts {
+			nineRouterKeys = append(nineRouterKeys, strings.TrimSpace(v))
+		}
+	}
+
+	nineRouterChatKeysRaw := os.Getenv("NINEROUTER_CHAT_KEYS")
+	var nineRouterChatKeys []string
+	if nineRouterChatKeysRaw != "" {
+		parts := strings.Split(nineRouterChatKeysRaw, ",")
+		for _, v := range parts {
+			nineRouterChatKeys = append(nineRouterChatKeys, strings.TrimSpace(v))
+		}
+	}
 
 	Env = AppConfig{
 		Port:             port,
@@ -129,6 +152,16 @@ func LoadConfig() {
 				return q
 			}
 			return "upload_queue"
+		}(),
+		NineRouterKeys:   nineRouterKeys,
+		NineRouterBaseURL: os.Getenv("NINEROUTER_BASE_URL"),
+		NineRouterModel:  os.Getenv("NINEROUTER_MODEL"),
+		NineRouterChatKeys: nineRouterChatKeys,
+		NineRouterChatModel: func() string {
+			if m := os.Getenv("NINEROUTER_CHAT_MODEL"); m != "" {
+				return m
+			}
+			return "Mindex2" // Default
 		}(),
 	}
 }

@@ -64,7 +64,11 @@ func QuickSummary(c *gin.Context) {
 	var finalSummary string
 	content := strings.Join(chunks, "\n\n")
 
-	systemPrompt := `Bạn là chuyên gia phân tích tài liệu học thuật. 
+	systemPrompt := `Bạn là chuyên gia phân tích tài liệu học thuật.`
+	// Apply Mindex Branding (Identity and Tone, excluding Opening Greeting for JSON)
+	systemPrompt = utils.ApplyMindexBrandingSummary(systemPrompt)
+
+	systemPrompt += `
 Bạn CHỈ trả về duy nhất định dạng JSON thuần, không bao gồm markdown hay giải thích. 
 Cấu trúc JSON bắt buộc: { 
   "overview": "tóm tắt tổng quan nội dung bằng tiếng Việt (dùng markdown nếu cần)", 
@@ -184,6 +188,8 @@ func DetailedSummary(c *gin.Context) {
 	} else {
 		prompt = persona.Cache.Get(userPersona).PromptSummaryDetailed
 	}
+	// Apply Mindex Branding (Identity, Tone, Opening) - Tóm tắt luôn được coi là tin nhắn đầu
+	prompt = utils.ApplyMindexBranding(prompt, true)
 
 	chunks := getAllDocumentChunks(req.DocumentID)
 	contextText := strings.Join(chunks, "\n\n")

@@ -29,6 +29,8 @@ func main() {
 	utils.MistralPool = utils.NewApiKeyPool("mistral", config.Env.MistralKeys)
 	utils.OpenRouterPool = utils.NewApiKeyPool("openrouter", config.Env.OpenRouterKeys)
 	utils.HFPool = utils.NewApiKeyPool("hf", config.Env.HuggingFaceKeys)
+	utils.NineRouterPool = utils.NewApiKeyPool("ninerouter", config.Env.NineRouterKeys)
+	utils.NineRouterChatPool = utils.NewApiKeyPool("ninerouter_chat", config.Env.NineRouterChatKeys)
 	
 	log.Printf("Đã khởi tạo Gemini Pool: Chat (%d keys), Embed (%d keys)", len(config.Env.GeminiChatKeys), len(config.Env.GeminiEmbedKeys))
 	log.Printf("Đã khởi tạo Groq Pool với %d keys", len(config.Env.GroqKeys))
@@ -58,6 +60,8 @@ func main() {
     for i, k := range config.Env.MistralKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderMistral, fmt.Sprintf("mistral_%d", i+1)) }
     for i, k := range config.Env.OpenRouterKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderOpenRouter, fmt.Sprintf("openrouter_%d", i+1)) }
     for i, k := range config.Env.HuggingFaceKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderHuggingFace, fmt.Sprintf("hf_%d", i+1)) }
+    for i, k := range config.Env.NineRouterKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderNineRouter, fmt.Sprintf("ninerouter_%d", i+1)) }
+    for i, k := range config.Env.NineRouterChatKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderNineRouter, fmt.Sprintf("ninerouter_chat_%d", i+1)) }
 
 	// 3b. Init Persona Cache
 	if err := persona.Cache.Load(config.DB); err != nil {
@@ -77,6 +81,7 @@ func main() {
 	workers.StartWorkerPool()
 	workers.StartSweeper() // Chạy ngầm dọn dẹp lúc 3AM
 	workers.StartExpirer() // Thông báo hết hạn realtime
+	workers.StartAlertChecker() // Giám sát chất lượng AI, alert nếu thumbs down > 30%
 
 	// 4b. Khởi chạy WebSocket Hub cho Feedback
 	go ws.GlobalHub.Run()
@@ -120,6 +125,8 @@ func main() {
 		routes.RegisterNotificationRoutes(api)
 		routes.RegisterFeedbackRoutes(api)
 		routes.RegisterBillingRoutes(api)
+		routes.RegisterStudyToolsRoutes(api) // P1: Flashcard + Quiz
+
 	}
 
 	// 8. Start server

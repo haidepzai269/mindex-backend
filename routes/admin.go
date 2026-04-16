@@ -30,5 +30,11 @@ func RegisterAdminRoutes(r *gin.RouterGroup) {
 		// Billings
 		admin.GET("/billings", controllers.AdminGetBillingsStats)
 		admin.POST("/billings/prices", controllers.AdminUpdateBillingPrices)
+
+		// Quality Monitoring (P0)
+		admin.GET("/quality/stats", controllers.AdminQualityStats)
+		admin.GET("/quality/timeline", controllers.AdminQualityTimeline)
+		admin.GET("/quality/low-rated", controllers.AdminLowRatedQuestions)
 	}
 }
+

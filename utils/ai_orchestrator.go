@@ -3,6 +3,7 @@ package utils
 import (
 	"fmt"
 	"log"
+	"mindex-backend/config"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +29,7 @@ const (
 	ProviderMistral    ProviderType = "mistral"
 	ProviderOpenRouter ProviderType = "openrouter"
 	ProviderHF         ProviderType = "huggingface"
+	ProviderNineRouter ProviderType = "ninerouter"
 )
 
 // AIProviderConfig chứa thông tin cấu hình cho một Provider cụ thể trong một Service
@@ -56,34 +58,38 @@ func InitOrchestrator() {
 		Priorities: make(map[ServiceType][]AIProviderConfig),
 	}
 
-	// 1. CHAT (RAG)
+	// 1. CHAT (RAG) - Ưu tiên Mindex2 (Combo 10 LLMs), Fallback sang các Provider khác nếu lỗi
 	AI.Priorities[ServiceChat] = []AIProviderConfig{
+		{Type: ProviderNineRouter, Model: config.Env.NineRouterChatModel, Pool: NineRouterChatPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
 		{Type: ProviderCerebras, Model: "qwen-3-235b-a22b-instruct-2507", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
 		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
 		{Type: ProviderOpenRouter, Model: "google/gemini-2.0-flash-exp:free", Pool: OpenRouterPool, IsOpenAI: true, BaseURL: "https://openrouter.ai/api/v1"},
 	}
 
-	// 2. TÓM TẮT (SUMMARY)
+	// 2. TÓM TẮT (SUMMARY) - NineRouter lên vị trí số 1
 	AI.Priorities[ServiceSummary] = []AIProviderConfig{
+		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderGemini, Model: "gemini-2.5-flash-lite", Pool: GeminiChatPool, IsOpenAI: false},
 		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
 		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
 		{Type: ProviderOpenRouter, Model: "deepseek/deepseek-r1:free", Pool: OpenRouterPool, IsOpenAI: true, BaseURL: "https://openrouter.ai/api/v1"},
 	}
 
-	// 3. PHÂN LOẠI (CLASSIFY)
+	// 3. PHÂN LOẠI (CLASSIFY) - NineRouter ở vị trí số 2
 	AI.Priorities[ServiceClassify] = []AIProviderConfig{
 		{Type: ProviderGemini, Model: "gemini-2.5-flash-lite", Pool: GeminiChatPool, IsOpenAI: false},
+		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderCerebras, Model: "qwen-3-235b-a22b-instruct-2507", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
 		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
 		{Type: ProviderHF, Model: "facebook/bart-large-mnli", Pool: HFPool, IsOpenAI: false},
 	}
 
-	// 4. TÌM KIẾM (SEARCH)
+	// 4. TÌM KIẾM (SEARCH) - NineRouter ở vị trí số 3
 	AI.Priorities[ServiceSearch] = []AIProviderConfig{
 		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
 		{Type: ProviderCerebras, Model: "llama3.1-8b", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
+		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
 		{Type: ProviderHF, Model: "meta-llama/Llama-3.2-3B-Instruct", Pool: HFPool, IsOpenAI: false},
 	}

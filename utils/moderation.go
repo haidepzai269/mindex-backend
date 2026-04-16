@@ -93,7 +93,10 @@ func T3AICheck(rawText string) (bool, string, string) {
 	// Làm sạch text để tránh lỗi JSON hoặc ký tự lạ khi gửi sang AI
 	cleanSample := regexp.MustCompile(`[\r\n\t]+`).ReplaceAllString(sampleText, " ")
 	cleanSample = regexp.MustCompile(`[^\p{L}\p{N}\p{P}\s]+`).ReplaceAllString(cleanSample, "")
-	if len(cleanSample) > 2000 { cleanSample = cleanSample[:2000] }
+	runes := []rune(cleanSample)
+	if len(runes) > 2000 {
+		cleanSample = string(runes[:2000])
+	}
 
 	prompt := fmt.Sprintf(`Phân tích 500 từ đầu tiên của tài liệu này và trả về JSON duy nhất:
 {
