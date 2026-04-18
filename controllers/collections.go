@@ -168,16 +168,26 @@ func UpdateCollection(c *gin.Context) {
 	userID := c.GetString("user_id")
 	colID := c.Param("id")
 	var req struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
-		Emoji       string `json:"emoji"`
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Emoji       string   `json:"emoji"`
+		DocumentIDs []string `json:"document_ids"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"success": false, "message": "Dữ liệu không hợp lệ"})
 		return
 	}
 
-	_, err := config.DB.Exec(config.Ctx, `
+	// Bắt đầu Transaction để cập nhật cả thông tin và danh sách file
+	tx, err := config.DB.Begin(config.Ctx)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "message": "Lỗi kết nối DB"})
+		return
+	}
+	defer tx.Rollback(config.Ctx)
+
+	// 1. Cập nhật thông tin cơ bản
+	_, err = tx.Exec(config.Ctx, `
 		UPDATE collections 
 		SET name = COALESCE(NULLIF($1, ''), name), 
 		    description = $2, 
@@ -187,11 +197,43 @@ func UpdateCollection(c *gin.Context) {
 		req.Name, req.Description, req.Emoji, colID, userID)
 
 	if err != nil {
-		c.JSON(500, gin.H{"success": false, "message": "Không thể cập nhật"})
+		c.JSON(500, gin.H{"success": false, "message": "Không thể cập nhật thông tin bộ"})
 		return
 	}
 
-	c.JSON(200, gin.H{"success": true, "message": "Đã cập nhật bộ tài liệu"})
+	// 2. Nếu có gửi danh sách DocumentIDs, thực hiện đồng bộ lại
+	if req.DocumentIDs != nil {
+		// Validate số lượng
+		if len(req.DocumentIDs) > 5 {
+			c.JSON(400, gin.H{"success": false, "message": "Tối đa 5 tài liệu một bộ"})
+			return
+		}
+
+		// Xóa liên kết cũ
+		_, err = tx.Exec(config.Ctx, `DELETE FROM collection_documents WHERE collection_id = $1`, colID)
+		if err != nil {
+			c.JSON(500, gin.H{"success": false, "message": "Lỗi khi làm mới danh sách tài liệu"})
+			return
+		}
+
+		// Chèn liên kết mới
+		for i, docID := range req.DocumentIDs {
+			_, err = tx.Exec(config.Ctx, `
+				INSERT INTO collection_documents (collection_id, document_id, display_order) 
+				VALUES ($1, $2, $3)`, colID, docID, i)
+			if err != nil {
+				c.JSON(500, gin.H{"success": false, "message": "Lỗi khi lưu danh sách tài liệu mới"})
+				return
+			}
+		}
+	}
+
+	if err := tx.Commit(config.Ctx); err != nil {
+		c.JSON(500, gin.H{"success": false, "message": "Lỗi lưu dữ liệu cuối cùng"})
+		return
+	}
+
+	c.JSON(200, gin.H{"success": true, "message": "Đã cập nhật bộ tài liệu thành công"})
 }
 
 // DeleteCollection xóa bộ tài liệu

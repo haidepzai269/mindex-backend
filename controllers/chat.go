@@ -60,21 +60,23 @@ func ChatMessage(c *gin.Context) {
 		userPersona = "student"
 	}
 
-	log.Printf("📥 [CHAT] [User: %s] [Doc: %s] [Session: %s] Question: %s", userID, req.DocumentID, req.SessionID, req.Question)
+	log.Printf("📥 [CHAT] [User: %s] [Doc: %s] [Col: %s] [Session: %s] Question: %s", userID, req.DocumentID, req.CollectionID, req.SessionID, req.Question)
 	
 	// --- MỚI: KIỂM TRA HẾT HẠN (EXPIRED CHECK) ---
 	var expiredAt *time.Time
 	var targetTitle string
 	if req.CollectionID != "" {
-		err := config.DB.QueryRow(config.Ctx, "SELECT name, expired_at FROM collections WHERE id = $1", req.CollectionID).Scan(&targetTitle, &expiredAt)
+		err := config.DB.QueryRow(config.Ctx, "SELECT name FROM collections WHERE id = $1", req.CollectionID).Scan(&targetTitle)
 		if err != nil {
+			log.Printf("❌ [CHAT] Collection query failed for ID [%s]: %v", req.CollectionID, err)
 			c.JSON(404, gin.H{"success": false, "error": "NOT_FOUND", "message": "Bộ tài liệu không tồn tại"})
 			return
 		}
 	} else if req.DocumentID != "" {
 		err := config.DB.QueryRow(config.Ctx, "SELECT title, expired_at FROM documents WHERE id = $1", req.DocumentID).Scan(&targetTitle, &expiredAt)
 		if err != nil {
-			c.JSON(404, gin.H{"success": false, "error": "NOT_FOUND", "message": "Tài liệu không tồn tại"})
+			log.Printf("❌ [CHAT] Document query failed for ID [%s]: %v", req.DocumentID, err)
+			c.JSON(404, gin.H{"success": false, "error": "NOT_FOUND", "message": "Tài liệu không tồn tại hoặc đã hết hạn"})
 			return
 		}
 	}
