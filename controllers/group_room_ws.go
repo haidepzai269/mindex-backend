@@ -65,8 +65,9 @@ func ConnectRoomWS(c *gin.Context) {
 // handleRoomIncomingMessage xử lý tin nhắn đến từ client WS
 func handleRoomIncomingMessage(client *ws.RoomClient, roomID, userID string, raw []byte) {
 	var incoming struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
+		Type      string `json:"type"`
+		Text      string `json:"text"`
+		ReplyToID string `json:"reply_to_id,omitempty"`
 	}
 	if err := json.Unmarshal(raw, &incoming); err != nil {
 		return
@@ -99,6 +100,7 @@ func handleRoomIncomingMessage(client *ws.RoomClient, roomID, userID string, raw
 			Text:       parsed.RawText,
 			MentionsAI: parsed.MentionsAI,
 			Mentions:   parsed.MentionedUIDs,
+			ReplyToID:  incoming.ReplyToID,
 			Timestamp:  time.Now(),
 		}
 
@@ -120,6 +122,67 @@ func handleRoomIncomingMessage(client *ws.RoomClient, roomID, userID string, raw
 		if parsed.MentionsAI {
 			go handleRoomAI(roomID, userID, parsed.CleanForRAG)
 		}
+
+	case "message_reaction":
+		var reactReq struct {
+			MessageID string `json:"message_id"`
+			Emoji     string `json:"emoji"`
+		}
+		if err := json.Unmarshal(raw, &reactReq); err != nil {
+			return
+		}
+		handleMessageReaction(roomID, userID, reactReq.MessageID, reactReq.Emoji)
+	}
+}
+
+func handleMessageReaction(roomID, userID, msgID, emoji string) {
+	if config.RedisClient == nil {
+		return
+	}
+	key := fmt.Sprintf("room_chat_history:%s", roomID)
+	msgs, err := config.RedisClient.LRange(config.Ctx, key, 0, 49).Result()
+	if err != nil {
+		return
+	}
+
+	var updatedMsg *models.RoomChatMessage
+	for i, mJSON := range msgs {
+		var m models.RoomChatMessage
+		if json.Unmarshal([]byte(mJSON), &m) == nil && m.ID == msgID {
+			if m.Reactions == nil {
+				m.Reactions = make(map[string][]string)
+			}
+			
+			// Toggle reaction: Nếu đã thả cùng emoji thì xóa, chưa thì thêm
+			uids := m.Reactions[emoji]
+			found := false
+			for idx, uid := range uids {
+				if uid == userID {
+					m.Reactions[emoji] = append(uids[:idx], uids[idx+1:]...)
+					found = true
+					break
+				}
+			}
+			if !found {
+				m.Reactions[emoji] = append(uids, userID)
+			}
+			
+			if len(m.Reactions[emoji]) == 0 {
+				delete(m.Reactions, emoji)
+			}
+
+			updatedMsg = &m
+			newJSON, _ := json.Marshal(m)
+			config.RedisClient.LSet(config.Ctx, key, int64(i), newJSON)
+			break
+		}
+	}
+
+	if updatedMsg != nil {
+		ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{
+			Type: "message_reaction", RoomID: roomID, UserID: userID,
+			Payload: updatedMsg,
+		})
 	}
 }
 

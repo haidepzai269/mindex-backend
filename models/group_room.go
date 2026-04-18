@@ -53,8 +53,10 @@ type RoomChatMessage struct {
 	Text        string      `json:"text"`
 	MentionsAI  bool        `json:"mentions_ai,omitempty"`
 	Mentions    []string    `json:"mentions,omitempty"` // userIDs được @tag
-	IsAI        bool        `json:"is_ai,omitempty"`
-	Timestamp   time.Time   `json:"timestamp"`
+	IsAI        bool               `json:"is_ai,omitempty"`
+	Reactions   map[string][]string `json:"reactions,omitempty"` // emoji -> []userIDs
+	ReplyToID   string             `json:"reply_to_id,omitempty"`
+	Timestamp   time.Time          `json:"timestamp"`
 }
 
 // RoomEvent - event gửi qua WebSocket
