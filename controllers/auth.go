@@ -100,6 +100,11 @@ func Register(c *gin.Context) {
 		return
 	}
 
+	// Cập nhật Bloom Filter
+	if utils.EmailBloom != nil {
+		utils.EmailBloom.Add(req.Email)
+	}
+
 	access, refresh, _ := utils.GenerateTokenPair(userID, "user", personaVal)
 
 	setTokenCookies(c, access, refresh)
@@ -735,6 +740,39 @@ func GoogleLogin(c *gin.Context) {
 				"urls":       user.URLs,
 				"avatar_url": user.AvatarURL,
 			},
+		},
+	})
+}
+func CheckEmail(c *gin.Context) {
+	email := c.Query("email")
+	if email == "" {
+		c.JSON(400, gin.H{"success": false, "message": "Thiếu email"})
+		return
+	}
+
+	// 1. Kiểm tra Bloom Filter (Cực nhanh)
+	if utils.EmailBloom != nil {
+		exists := utils.EmailBloom.Test(email)
+		if !exists {
+			// Nếu Bloom bảo chắc chắn không có -> Available
+			c.JSON(200, gin.H{"success": true, "data": gin.H{"available": true, "method": "bloom"}})
+			return
+		}
+	}
+
+	// 2. Nếu Bloom bảo "có thể có" -> Check DB để xác nhận (Phòng trường hợp False Positive)
+	var count int
+	err := config.DB.QueryRow(config.Ctx, "SELECT COUNT(*) FROM users WHERE email = $1", email).Scan(&count)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "message": "Lỗi hệ thống"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"success": true,
+		"data": gin.H{
+			"available": count == 0,
+			"method":    "database",
 		},
 	})
 }

@@ -68,6 +68,23 @@ func main() {
 		log.Fatalf("Failed to load persona prompts: %v", err)
 	}
 
+	// 3c. Init Bloom Filter for Email Checking
+	var emails []string
+	rows, err := config.DB.Query(config.Ctx, "SELECT email FROM users")
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var e string
+			rows.Scan(&e)
+			emails = append(emails, e)
+		}
+		utils.InitEmailBloom(emails)
+		log.Printf("Đã khởi tạo Email Bloom Filter với %d địa chỉ", len(emails))
+	} else {
+		log.Printf("Cảnh báo: Không thể tải emails để khởi tạo Bloom Filter: %v", err)
+		utils.InitEmailBloom(nil) // Khởi tạo trống
+	}
+
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		for range ticker.C {

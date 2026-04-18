@@ -9,13 +9,24 @@ import (
 func EnrichChunk(chunkContent string, docSummary string) (string, error) {
 	// Prompt tối ưu theo kỹ thuật của Anthropic
 	prompt := fmt.Sprintf(`
-Tài liệu của chúng ta có luân điểm/chủ đề sau: %s
-
-Đoạn văn dưới đây là một phần rải rác trong tài liệu đó. Hãy viết 1-2 câu ngắn đặt đoạn văn này vào ngữ cảnh của toàn tài liệu để AI có thể hiểu rõ hơn khi tìm kiếm. 
-Lưu ý: Chỉ trả về phần ngữ cảnh bổ sung, không lặp lại nội dung gốc, không giải thích thêm.
-
-Đoạn văn cần xử lý:
+Tài liệu của chúng ta có luận điểm/chủ đề sau:
+<doc_summary>
 %s
+</doc_summary>
+
+Đoạn văn dưới đây là một phần trong tài liệu đó:
+<chunk>
+%s
+</chunk>
+
+Hãy viết 1-2 câu ngắn đặt đoạn văn này vào ngữ cảnh của toàn tài liệu, giúp AI tìm kiếm hiểu đúng vị trí và vai trò của đoạn này.
+
+RÀNG BUỘC:
+- Chỉ sử dụng thông tin có trong <doc_summary> và <chunk> ở trên.
+- Không được suy diễn, không thêm thông tin từ kiến thức bên ngoài.
+- Không lặp lại nội dung gốc của chunk.
+- Nếu không đủ context để đặt ngữ cảnh có nghĩa, trả về chuỗi rỗng: ""
+- Chỉ trả về câu ngữ cảnh (hoặc ""). Không giải thích thêm.
 `, docSummary, chunkContent)
 
 	messages := []ChatMessage{

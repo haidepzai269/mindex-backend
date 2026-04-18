@@ -18,6 +18,7 @@ func RegisterAuthRoutes(rg *gin.RouterGroup) {
 	auth.POST("/forgot-password/send-otp", controllers.ForgotPasswordSendOTP)
 	auth.POST("/forgot-password/reset", controllers.ResetPassword)
 	auth.GET("/onboarding-personas", controllers.GetOnboardingPersonas)
+	auth.GET("/check-email", controllers.CheckEmail)
 
 	// Protected routes
 	auth.Use(middleware.AuthMiddleware())

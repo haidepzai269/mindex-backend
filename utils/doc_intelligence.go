@@ -24,8 +24,20 @@ JSON schema yêu cầu:
   "thesis": "luận điểm trung tâm hoặc mục tiêu của tài liệu",
   "doc_type": "slide|book|paper|report|manual",
   "outline": [{"title": "Chương 1", "children": [{"title": "Mục 1.1"}]}],
-  "key_concepts": [{"name": "khái niệm", "definition": "...", "related_to": ["..."]}]
+  "key_concepts": [
+    {
+      "name": "tên khái niệm", 
+      "definition": "định nghĩa ngắn gọn", 
+      "related_to": ["tên_concept_1", "tên_concept_2"],
+      "page_reference": "trang X" hoặc "trang X–Y"
+    }
+  ]
 }
+
+RÀNG BUỘC QUAN TRỌNG:
+- related_to CHỈ được chứa tên đã xuất hiện trong array key_concepts này.
+- page_reference BẮT BUỘC. Nếu không xác định được trang, ghi "không rõ".
+- Nếu tài liệu không đủ thông tin để điền một field, dùng null. Không được bịa nội dung.
 
 Nội dung tài liệu:
 %s

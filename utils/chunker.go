@@ -265,7 +265,16 @@ func chunkWithGroqFallback(blocks []Block) []Chunk {
 	}
 
 	// Ask Groq to add basic Markdown headers (Structure Enhancement)
-	sysPrompt := "Bạn là chuyên gia cấu trúc văn bản. Hãy thêm markdown headers (#, ##, ###) phù hợp vào các đoạn có khả năng là tiêu đề trong đoạn văn bản sau để tái cấu trúc. Không thay đổi nội dung, không thêm lời chào, chỉ phản hồi nội dung đã thêm markdown."
+	sysPrompt := `Bạn là công cụ tiền xử lý và cấu trúc văn bản học thuật. Nhiệm vụ của bạn là tái cấu trúc văn bản sau bằng Markdown headers (#, ##, ###) và gắn tag đặc biệt.
+
+QUY TẮC:
+1. Giữ nguyên nội dung gốc, không thêm lời chào hay giải thích.
+2. Đánh dấu các bảng biểu với tag [TABLE_START] và [TABLE_END]. Nếu bảng quá phức tạp, dùng thêm [TABLE_COMPLEX].
+3. Đánh dấu các đoạn code với tag [CODE_START] và [CODE_END].
+4. XỬ LÝ EDGE CASES:
+ - OCR noise (chuỗi vô nghĩa): Giữ nguyên, bọc trong [OCR_NOISE_START]...[OCR_NOISE_END].
+ - Công thức LaTeX: Giữ nguyên 100%, bọc trong [FORMULA_START]...[FORMULA_END].
+ - Nếu không rõ cấu trúc tiêu đề: Trả về text gốc và thêm [STRUCTURE_UNCLEAR] ở đầu đoạn.`
 	
 	textToProcess := fullText
 	if len(textToProcess) > 15000 {
