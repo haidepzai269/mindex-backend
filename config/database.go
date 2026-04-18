@@ -205,6 +205,44 @@ func ConnectDB() {
 		CREATE INDEX IF NOT EXISTS idx_search_histories_user_id ON search_histories(user_id, created_at DESC);
 	`)
 	log.Println("✅ Migration search_histories hoàn tất")
+    
+	// Migration: Group Study Chat (S1)
+	_, err = DB.Exec(context.Background(), `
+		CREATE TABLE IF NOT EXISTS group_rooms (
+			id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			invite_code  VARCHAR(12) UNIQUE NOT NULL,
+			host_id      UUID REFERENCES users(id) ON DELETE SET NULL,
+			name         VARCHAR(100),
+			max_members  INT DEFAULT 5,
+			status       VARCHAR(10) DEFAULT 'active',
+			created_at   TIMESTAMPTZ DEFAULT now(),
+			closed_at    TIMESTAMPTZ
+		);
+
+		CREATE TABLE IF NOT EXISTS group_room_members (
+			room_id    UUID REFERENCES group_rooms(id) ON DELETE CASCADE,
+			user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+			joined_at  TIMESTAMPTZ DEFAULT now(),
+			left_at    TIMESTAMPTZ,
+			doc_count  INT DEFAULT 0,
+			is_host    BOOLEAN DEFAULT false,
+			PRIMARY KEY (room_id, user_id)
+		);
+
+		-- Bổ sung cột room_id vào documents nếu chưa có
+		DO $$ 
+		BEGIN 
+			IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='documents' AND column_name='room_id') THEN
+				ALTER TABLE documents ADD COLUMN room_id UUID REFERENCES group_rooms(id) ON DELETE SET NULL;
+				CREATE INDEX idx_documents_room ON documents(room_id) WHERE room_id IS NOT NULL;
+			END IF;
+		END $$;
+	`)
+	if err != nil {
+		log.Printf("❌ Migration Group Chat lỗi: %v", err)
+	} else {
+		log.Println("✅ Migration group_rooms & members hoàn tất")
+	}
 }
 
 func CloseDB() {

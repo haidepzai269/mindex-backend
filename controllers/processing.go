@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"mindex-backend/config"
+	"mindex-backend/internal/ws"
+	"mindex-backend/models"
 	"mindex-backend/utils"
 	"net/http"
 	"os"
@@ -113,8 +115,24 @@ func InitiateUpload(c *gin.Context) {
 	// 2. Nếu là file mới hoàn toàn -> Tiếp tục quy trình bình thường
 	cloudinaryURL := c.PostForm("cloudinary_url")
 	filename := c.PostForm("filename")
+	roomID := c.PostForm("room_id") // Nhận room_id nếu upload vào phòng
+
 	if filename == "" {
 		filename = fileHeader.Filename
+	}
+
+	// Logic Group Chat: Kiểm tra quyền và quota trong phòng
+	if roomID != "" {
+		if !IsRoomMember(roomID, userID) {
+			c.JSON(403, gin.H{"success": false, "message": "Bạn không có quyền upload vào phòng này"})
+			return
+		}
+		var docCount int
+		config.DB.QueryRow(config.Ctx, `SELECT doc_count FROM group_room_members WHERE room_id = $1 AND user_id = $2`, roomID, userID).Scan(&docCount)
+		if docCount >= 3 {
+			c.JSON(403, gin.H{"success": false, "error": "ROOM_DOC_LIMIT", "message": "Tối đa 3 tài liệu/người trong một phòng."})
+			return
+		}
 	}
 
 	// Tạo thư mục tạm nếu chưa có
@@ -130,15 +148,30 @@ func InitiateUpload(c *gin.Context) {
 		return
 	}
 
-	// 4. Lưu bản ghi pending vào DB (với file_hash)
-	_, err = config.DB.Exec(
-		config.Ctx,
-		`INSERT INTO documents (id, user_id, title, cloudinary_url, status, creator_persona, expired_at, file_hash) 
-		 VALUES ($1, $2, $3, $4, 'queued', $5, NOW() + INTERVAL '24 hours', $6)`,
-		docID, userID, filename, cloudinaryURL, userPersona, fileHash,
-	)
-	if err != nil {
-		c.JSON(500, gin.H{"success": false, "message": "Không thể tạo tài liệu trong DB (Có thể file đang được xử lý bởi người khác)"})
+	// 4. Lưu bản ghi pending vào DB (với file_hash và room_id)
+	var errDB error
+	if roomID != "" {
+		_, errDB = config.DB.Exec(
+			config.Ctx,
+			`INSERT INTO documents (id, user_id, title, cloudinary_url, status, creator_persona, expired_at, file_hash, room_id) 
+			 VALUES ($1, $2, $3, $4, 'queued', $5, NULL, $6, $7)`, // Room doc không hết hạn
+			docID, userID, filename, cloudinaryURL, userPersona, fileHash, roomID,
+		)
+		// Cập nhật số lượng doc của user trong phòng
+		if errDB == nil {
+			config.DB.Exec(config.Ctx, `UPDATE group_room_members SET doc_count = doc_count + 1 WHERE room_id = $1 AND user_id = $2`, roomID, userID)
+		}
+	} else {
+		_, errDB = config.DB.Exec(
+			config.Ctx,
+			`INSERT INTO documents (id, user_id, title, cloudinary_url, status, creator_persona, expired_at, file_hash) 
+			 VALUES ($1, $2, $3, $4, 'queued', $5, NOW() + INTERVAL '24 hours', $6)`,
+			docID, userID, filename, cloudinaryURL, userPersona, fileHash,
+		)
+	}
+
+	if errDB != nil {
+		c.JSON(500, gin.H{"success": false, "message": "Không thể tạo tài liệu trong DB"})
 		return
 	}
 
@@ -162,6 +195,16 @@ func InitiateUpload(c *gin.Context) {
 		config.DB.Exec(config.Ctx, `UPDATE documents SET status='error' WHERE id=$1`, docID)
 		c.JSON(500, gin.H{"success": false, "message": "Lỗi hệ thống hàng đợi"})
 		return
+	}
+
+	// Broadcast sự kiện upload tài liệu nếu ở trong phòng
+	if roomID != "" {
+		var userName string
+		config.DB.QueryRow(config.Ctx, `SELECT name FROM users WHERE id = $1`, userID).Scan(&userName)
+		ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{
+			Type: "doc_uploaded", RoomID: roomID, UserID: userID,
+			Payload: gin.H{"user_name": userName, "doc_name": filename},
+		})
 	}
 
 	c.JSON(202, gin.H{

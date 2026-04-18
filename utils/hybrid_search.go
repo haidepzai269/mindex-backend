@@ -165,3 +165,91 @@ func ReciprocalRankFusion(vector, fts []ChunkResult, topK int) []ChunkResult {
 	}
 	return final
 }
+
+// HybridSearchByDocIDs gộp kết quả từ Vector Search và Full-Text Search trên danh sách DocIDs
+func HybridSearchByDocIDs(docIDs []string, query string, topK int) ([]string, error) {
+	// 1. Sinh embedding cho query
+	queryVec, err := GenerateEmbedding(context.Background(), query)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. Chạy Vector Search
+	vectorResults, err := vectorSearchByDocIDs(docIDs, queryVec, topK*2)
+	if err != nil {
+		log.Printf("⚠️ [HybridSearchByDocIDs] Vector Search failed: %v", err)
+	}
+
+	// 3. Chạy Full-Text Search
+	ftsResults, err := fullTextSearchByDocIDs(docIDs, query, topK*2)
+	if err != nil {
+		log.Printf("⚠️ [HybridSearchByDocIDs] FTS failed: %v", err)
+	}
+
+	// 4. Fusion
+	fused := ReciprocalRankFusion(vectorResults, ftsResults, topK)
+	
+	var final []string
+	for _, r := range fused {
+		final = append(final, r.RetrievalContent)
+	}
+	return final, nil
+}
+
+func vectorSearchByDocIDs(docIDs []string, queryVec []float32, limit int) ([]ChunkResult, error) {
+	vecStr := FloatSliceToVectorString(queryVec)
+	query := `
+		SELECT c.id, COALESCE(c.retrieval_content, c.content), COALESCE(c.chunk_index, 0), COALESCE(c.page_number, 0), d.title, d.id,
+		       1 - (c.embedding <=> $1::vector) AS similarity
+		FROM document_chunks c
+		JOIN documents d ON c.document_id = d.id
+		WHERE d.id = ANY($2::uuid[]) AND d.status = 'ready'
+		ORDER BY similarity DESC LIMIT $3`
+
+	rows, err := config.DB.Query(context.Background(), query, vecStr, docIDs, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []ChunkResult
+	for rows.Next() {
+		var r ChunkResult
+		var sim float64
+		if err := rows.Scan(&r.ID, &r.RetrievalContent, &r.ChunkIndex, &r.PageNumber, &r.DocTitle, &r.DocID, &sim); err != nil {
+			continue
+		}
+		r.Score = sim
+		results = append(results, r)
+	}
+	return results, nil
+}
+
+func fullTextSearchByDocIDs(docIDs []string, userQuery string, limit int) ([]ChunkResult, error) {
+	query := `
+		SELECT c.id, COALESCE(c.retrieval_content, c.content), COALESCE(c.chunk_index, 0), COALESCE(c.page_number, 0), d.title, d.id,
+		       ts_rank_cd(c.content_tsv, websearch_to_tsquery('simple', $1)) AS rank
+		FROM document_chunks c
+		JOIN documents d ON c.document_id = d.id
+		WHERE d.id = ANY($2::uuid[]) AND d.status = 'ready'
+		  AND c.content_tsv @@ websearch_to_tsquery('simple', $1)
+		ORDER BY rank DESC LIMIT $3`
+
+	rows, err := config.DB.Query(context.Background(), query, userQuery, docIDs, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var results []ChunkResult
+	for rows.Next() {
+		var r ChunkResult
+		var rank float64
+		if err := rows.Scan(&r.ID, &r.RetrievalContent, &r.ChunkIndex, &r.PageNumber, &r.DocTitle, &r.DocID, &rank); err != nil {
+			continue
+		}
+		r.Score = rank
+		results = append(results, r)
+	}
+	return results, nil
+}

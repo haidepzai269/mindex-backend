@@ -100,8 +100,9 @@ func main() {
 	workers.StartExpirer() // Thông báo hết hạn realtime
 	workers.StartAlertChecker() // Giám sát chất lượng AI, alert nếu thumbs down > 30%
 
-	// 4b. Khởi chạy WebSocket Hub cho Feedback
+	// 4b. Khởi chạy WebSocket Hub cho Feedback & Group Chat
 	go ws.GlobalHub.Run()
+	go ws.RoomHubInstance.Run()
 
 
 	// 5. Init router
@@ -143,7 +144,7 @@ func main() {
 		routes.RegisterFeedbackRoutes(api)
 		routes.RegisterBillingRoutes(api)
 		routes.RegisterStudyToolsRoutes(api) // P1: Flashcard + Quiz
-
+		routes.RegisterRoomRoutes(api)        // Group Study Chat
 	}
 
 	// 8. Start server

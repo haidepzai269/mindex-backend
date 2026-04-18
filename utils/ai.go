@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -83,5 +84,10 @@ func SplitIntoChunks(text string, chunkSize int, overlap int) []string {
 }
 
 
-// CleanTextLocal được gọi trực tiếp từ text_cleaner.go
-// Không cần placeholder ở đây nữa.
+// GenerateEmbedding là wrapper sử dụng pool để lấy vector embedding
+func GenerateEmbedding(ctx context.Context, text string) ([]float32, error) {
+	if GeminiEmbedPool == nil {
+		return nil, fmt.Errorf("GeminiEmbedPool chưa được khởi tạo")
+	}
+	return GeminiEmbedPool.EmbedWithRetry(text, CallGeminiAPI)
+}
