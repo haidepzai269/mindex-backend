@@ -1,9 +1,12 @@
 package controllers
 
 import (
+	"encoding/json"
 	"fmt"
 	"mindex-backend/config"
 	"mindex-backend/models"
+	"mindex-backend/utils"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -86,15 +89,31 @@ func CreateCollection(c *gin.Context) {
 		return
 	}
 
-	// 4. Trả về thông tin đầy đủ
+	// 4. Trả về thông tin đầy đủ và xóa cache
+	utils.ClearUserCache("collections", userID)
 	collection := getCollectionDetailHelper(colID, userID)
 	c.JSON(201, gin.H{"success": true, "data": collection})
 }
 
-// ListCollections lấy danh sách bộ tài liệu của user
+// ListCollections lấy danh sách bộ tài liệu của user (Có Cache)
 func ListCollections(c *gin.Context) {
 	userID := c.GetString("user_id")
+	cacheKey := utils.GenerateUserCacheKey("collections", userID)
 
+	// 1. Thử lấy từ Cache
+	if cacheData := utils.GetCache(cacheKey); cacheData != "" {
+		var collections []models.Collection
+		if err := json.Unmarshal([]byte(cacheData), &collections); err == nil {
+			c.JSON(200, gin.H{
+				"success": true,
+				"data":    collections,
+				"cached":  true,
+			})
+			return
+		}
+	}
+
+	// 2. Nếu không có cache, truy vấn DB
 	rows, err := config.DB.Query(config.Ctx, `
 		SELECT c.id, c.name, c.emoji, c.description, c.doc_count, c.last_chat_at, c.created_at,
 		       (SELECT MIN(d.expired_at) 
@@ -144,6 +163,11 @@ func ListCollections(c *gin.Context) {
 		col.Documents = previews
 		
 		collections = append(collections, col)
+	}
+
+	// 3. Lưu vào Cache (TTL 10 phút)
+	if jsonData, err := json.Marshal(collections); err == nil {
+		utils.SetCache(cacheKey, string(jsonData), 10*time.Minute)
 	}
 
 	c.JSON(200, gin.H{"success": true, "data": collections})
@@ -233,6 +257,7 @@ func UpdateCollection(c *gin.Context) {
 		return
 	}
 
+	utils.ClearUserCache("collections", userID)
 	c.JSON(200, gin.H{"success": true, "message": "Đã cập nhật bộ tài liệu thành công"})
 }
 
@@ -247,6 +272,7 @@ func DeleteCollection(c *gin.Context) {
 		return
 	}
 
+	utils.ClearUserCache("collections", userID)
 	c.JSON(200, gin.H{"success": true, "message": "Đã xóa bộ tài liệu"})
 }
 
@@ -282,6 +308,7 @@ func AddDocumentToCollection(c *gin.Context) {
 			VALUES ($1, $2) ON CONFLICT DO NOTHING`, colID, docID)
 	}
 
+	utils.ClearUserCache("collections", userID)
 	c.JSON(200, gin.H{"success": true, "message": "Đã thêm tài liệu vào bộ"})
 }
 
@@ -307,6 +334,7 @@ func RemoveDocumentFromCollection(c *gin.Context) {
 		return
 	}
 
+	utils.ClearUserCache("collections", userID)
 	c.JSON(200, gin.H{"success": true, "message": "Đã gỡ tài liệu khỏi bộ"})
 }
 

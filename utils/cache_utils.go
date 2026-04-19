@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// GenerateCacheKey tạo key redis chuẩn hóa cho query
+// GenerateCacheKey tạo key redis chuẩn hóa cho query (Community)
 func GenerateCacheKey(prefix string, query string, subject string) string {
 	// Chuẩn hóa query
 	q := strings.ToLower(strings.TrimSpace(query))
@@ -23,6 +23,11 @@ func GenerateCacheKey(prefix string, query string, subject string) string {
 		return fmt.Sprintf("cache:community:%s:%s:%s", prefix, queryHash, subject)
 	}
 	return fmt.Sprintf("cache:community:%s:%s", prefix, queryHash)
+}
+
+// GenerateUserCacheKey tạo key redis cho dữ liệu cá nhân của user
+func GenerateUserCacheKey(prefix string, userID string) string {
+	return fmt.Sprintf("cache:user:%s:%s", prefix, userID)
 }
 
 // GetCache lấy dữ liệu từ Redis (trả về chuỗi rỗng nếu lỗi hoặc không có)
@@ -43,6 +48,16 @@ func SetCache(key string, value string, expiration time.Duration) {
 		return
 	}
 	config.RedisClient.Set(config.Ctx, key, value, expiration)
+}
+
+// ClearUserCache xóa cache cụ thể của một user
+func ClearUserCache(prefix string, userID string) {
+	if config.RedisClient == nil {
+		return
+	}
+	key := GenerateUserCacheKey(prefix, userID)
+	config.RedisClient.Del(config.Ctx, key)
+	log.Printf("🧹 [Cache] Đã xóa cache user: %s", key)
 }
 
 // ClearCommunityCache xóa toàn bộ cache kết quả tìm kiếm/duyệt của Community

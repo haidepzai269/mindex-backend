@@ -44,6 +44,10 @@ func ConnectRoomWS(c *gin.Context) {
 	}
 
 	ws.RoomHubInstance.Register <- client
+	if config.RedisClient != nil {
+		config.RedisClient.Set(config.Ctx, fmt.Sprintf("room_online:%s:%s", roomID, userID), "1", 120*time.Second)
+		config.RedisClient.Set(config.Ctx, fmt.Sprintf("room_last_seen:%s:%s", roomID, userID), time.Now().Format(time.RFC3339), 7*24*time.Hour)
+	}
 
 	// Gửi 20 tin nhắn gần nhất cho client vừa join
 	go sendRoomHistory(client, roomID)
@@ -79,7 +83,10 @@ func handleRoomIncomingMessage(client *ws.RoomClient, roomID, userID string, raw
 		if config.RedisClient != nil {
 			config.RedisClient.Set(config.Ctx,
 				fmt.Sprintf("room_online:%s:%s", roomID, userID),
-				"1", 30*time.Second)
+				"1", 120*time.Second) // 2 phút grace period
+			config.RedisClient.Set(config.Ctx,
+				fmt.Sprintf("room_last_seen:%s:%s", roomID, userID),
+				time.Now().Format(time.RFC3339), 7*24*time.Hour)
 		}
 
 	case "chat_message":

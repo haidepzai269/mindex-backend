@@ -6,6 +6,7 @@ import (
 	"log"
 	"mindex-backend/config"
 	"mindex-backend/controllers"
+	"mindex-backend/utils"
 	"time"
 )
 
@@ -58,6 +59,10 @@ func runWorker() {
 		} else {
 			log.Printf("✅ Hoàn tất xử lý Doc %s", job.DocID)
 		}
+
+		// Xóa cache của user để cập nhật trạng thái mới trong Library
+		utils.ClearUserCache("docs", job.UserID)
+		utils.ClearUserCache("collections", job.UserID)
 	}
 }
 		

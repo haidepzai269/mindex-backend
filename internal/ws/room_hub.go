@@ -2,8 +2,10 @@ package ws
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -21,7 +23,9 @@ type RoomClient struct {
 type RoomHub struct {
 	// rooms map: roomID -> set of *RoomClient
 	rooms map[string]map[*RoomClient]bool
-	mu    sync.RWMutex
+	// timers map: roomID:userID -> timer for offline broadcast
+	timers map[string]*time.Timer
+	mu     sync.RWMutex
 
 	Register   chan *RoomClient
 	Unregister chan *RoomClient
@@ -30,6 +34,7 @@ type RoomHub struct {
 func NewRoomHub() *RoomHub {
 	return &RoomHub{
 		rooms:      make(map[string]map[*RoomClient]bool),
+		timers:     make(map[string]*time.Timer),
 		Register:   make(chan *RoomClient, 64),
 		Unregister: make(chan *RoomClient, 64),
 	}
@@ -44,6 +49,14 @@ func (h *RoomHub) Run() {
 				h.rooms[client.RoomID] = make(map[*RoomClient]bool)
 			}
 			h.rooms[client.RoomID][client] = true
+
+			// Hủy timer offline nếu đang đếm ngược
+			timerKey := fmt.Sprintf("%s:%s", client.RoomID, client.UserID)
+			if timer, ok := h.timers[timerKey]; ok {
+				timer.Stop()
+				delete(h.timers, timerKey)
+				log.Printf("⏱️ [RoomHub] Cancelled offline timer for user %s", client.UserID)
+			}
 			h.mu.Unlock()
 			log.Printf("🏠 [RoomHub] User %s joined room %s", client.UserID, client.RoomID)
 
@@ -53,13 +66,56 @@ func (h *RoomHub) Run() {
 				if _, ok := roomClients[client]; ok {
 					delete(roomClients, client)
 					close(client.Send)
+
+					// Kiểm tra xem user còn kết nối nào khác trong phòng không
+					stillHasConn := false
+					for c := range roomClients {
+						if c.UserID == client.UserID {
+							stillHasConn = true
+							break
+						}
+					}
+
+					// Nếu không còn kết nối nào -> đặt timer broadcast offline sau 2 phút
+					if !stillHasConn {
+						timerKey := fmt.Sprintf("%s:%s", client.RoomID, client.UserID)
+						// Dùng biến local để tránh closure capture sai
+						rid := client.RoomID
+						uid := client.UserID
+
+						h.timers[timerKey] = time.AfterFunc(2*time.Minute, func() {
+							h.mu.Lock()
+							delete(h.timers, timerKey)
+							h.mu.Unlock()
+
+							// Broadcast sự kiện offline tới mọi người trong phòng
+							// (Ở đây ta dùng event type "user_offline" hoặc "user_left")
+							h.BroadcastToRoom(rid, struct {
+								Type    string `json:"type"`
+								RoomID  string `json:"room_id"`
+								UserID  string `json:"user_id"`
+								Payload interface{} `json:"payload"`
+							}{
+								Type:   "user_offline",
+								RoomID: rid,
+								UserID: uid,
+								Payload: map[string]string{
+									"user_id": uid,
+									"status":  "offline",
+								},
+							})
+							log.Printf("📡 [RoomHub] Broadcasted user_offline for %s", uid)
+						})
+						log.Printf("⏱️ [RoomHub] Started offline timer for user %s (2m grace period)", client.UserID)
+					}
+
 					if len(roomClients) == 0 {
 						delete(h.rooms, client.RoomID)
 					}
 				}
 			}
 			h.mu.Unlock()
-			log.Printf("🚪 [RoomHub] User %s left room %s", client.UserID, client.RoomID)
+			log.Printf("🚪 [RoomHub] User %s disconnected from room %s", client.UserID, client.RoomID)
 		}
 	}
 }

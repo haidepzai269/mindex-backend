@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"mindex-backend/config"
@@ -22,10 +23,25 @@ type DocumentItem struct {
 	ChunkCount int        `json:"chunk_count"`
 }
 
-// GetMyDocuments trả về danh sách tài liệu của người dùng hiện tại
+// GetMyDocuments trả về danh sách tài liệu của người dùng hiện tại (Có Cache)
 func GetMyDocuments(c *gin.Context) {
 	userID := c.GetString("user_id")
+	cacheKey := utils.GenerateUserCacheKey("docs", userID)
 
+	// 1. Thử lấy từ Cache
+	if cacheData := utils.GetCache(cacheKey); cacheData != "" {
+		var docs []DocumentItem
+		if err := json.Unmarshal([]byte(cacheData), &docs); err == nil {
+			c.JSON(200, gin.H{
+				"success": true,
+				"data":    docs,
+				"cached":  true,
+			})
+			return
+		}
+	}
+
+	// 2. Nếu không có cache, truy vấn DB
 	rows, err := config.DB.Query(config.Ctx, `
 		SELECT d.id, d.title, d.status, d.created_at, d.shared_at, d.expired_at, dr.pinned, d.is_public,
 		       (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) as chunk_count
@@ -45,7 +61,6 @@ func GetMyDocuments(c *gin.Context) {
 	docs := []DocumentItem{}
 	for rows.Next() {
 		var d DocumentItem
-		// Scan trực tiếp vào các kiểu dữ liệu của pgx (time.Time hỗ trợ tốt TIMESTAMP)
 		err := rows.Scan(
 			&d.ID, 
 			&d.Title, 
@@ -63,6 +78,11 @@ func GetMyDocuments(c *gin.Context) {
 		}
 
 		docs = append(docs, d)
+	}
+
+	// 3. Lưu vào Cache (TTL 10 phút)
+	if jsonData, err := json.Marshal(docs); err == nil {
+		utils.SetCache(cacheKey, string(jsonData), 10*time.Minute)
 	}
 
 	c.JSON(200, gin.H{
@@ -222,9 +242,11 @@ func TogglePinDocument(c *gin.Context) {
 		}
 	}
 
-	// 4. Xóa cache profile user để /auth/me lấy dữ liệu mới
+	// 4. Xóa cache profile user để /auth/me lấy dữ liệu mới và xóa cache docs
 	if config.RedisClient != nil {
 		config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID))
+		utils.ClearUserCache("docs", userID)
+		utils.ClearUserCache("collections", userID) // Ghim/bỏ ghim có thể ảnh hưởng đến collection preview
 	}
 
 	// 5. Gửi thông báo realtime qua SSE để cập nhật sidebar ngay lập tức
@@ -284,6 +306,8 @@ func DeleteDocument(c *gin.Context) {
 	// 5. Xóa cache và gửi thông báo realtime
 	if config.RedisClient != nil {
 		config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID))
+		utils.ClearUserCache("docs", userID)
+		utils.ClearUserCache("collections", userID)
 		utils.ClearCommunityCache()
 	}
 	_ = utils.PublishNotification(userID, "quota_update", "Cập nhật dữ liệu", "Tài liệu đã được xóa", nil)
@@ -326,6 +350,7 @@ func UpdateDocumentPersona(c *gin.Context) {
 		return
 	}
 
+	utils.ClearUserCache("docs", userID)
 	utils.ClearCommunityCache()
 	c.JSON(200, gin.H{"success": true, "message": "Đã cập nhật lĩnh vực tài liệu"})
 }

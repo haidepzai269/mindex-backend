@@ -30,6 +30,7 @@ type GroupRoomMember struct {
 	DocCount int        `json:"doc_count"`
 	IsHost   bool       `json:"is_host"`
 	IsOnline bool       `json:"is_online"` // computed từ Redis heartbeat
+	LastSeen *time.Time `json:"last_seen,omitempty"`
 }
 
 // RoomDocument tài liệu trong phòng (có thêm owner info)

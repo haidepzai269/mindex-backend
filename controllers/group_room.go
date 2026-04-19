@@ -243,13 +243,23 @@ func GetRoom(c *gin.Context) {
 		return
 	}
 
-	// Đánh dấu ai đang online từ WS Hub
-	onlineSet := make(map[string]bool)
-	for _, uid := range ws.RoomHubInstance.GetOnlineUsers(roomID) {
-		onlineSet[uid] = true
-	}
+	// Đánh dấu ai đang online từ Redis (với grace period)
 	for i := range room.Members {
-		room.Members[i].IsOnline = onlineSet[room.Members[i].UserID]
+		if config.RedisClient != nil {
+			exists, _ := config.RedisClient.Exists(config.Ctx, fmt.Sprintf("room_online:%s:%s", roomID, room.Members[i].UserID)).Result()
+			room.Members[i].IsOnline = exists > 0
+		} else {
+			// Fallback về WS Hub nếu Redis lỗi
+			onlineUsers := ws.RoomHubInstance.GetOnlineUsers(roomID)
+			isOnline := false
+			for _, uid := range onlineUsers {
+				if uid == room.Members[i].UserID {
+					isOnline = true
+					break
+				}
+			}
+			room.Members[i].IsOnline = isOnline
+		}
 	}
 
 	c.JSON(200, gin.H{"success": true, "data": room})
@@ -455,6 +465,16 @@ func getRoomDetail(roomID string) *models.GroupRoom {
 			var m models.GroupRoomMember
 			rows.Scan(&m.UserID, &m.Name, &m.JoinedAt, &m.DocCount, &m.IsHost)
 			m.RoomID = roomID
+
+			// Lấy LastSeen từ Redis
+			if config.RedisClient != nil {
+				val, err := config.RedisClient.Get(config.Ctx, fmt.Sprintf("room_last_seen:%s:%s", roomID, m.UserID)).Result()
+				if err == nil {
+					t, _ := time.Parse(time.RFC3339, val)
+					m.LastSeen = &t
+				}
+			}
+
 			room.Members = append(room.Members, m)
 		}
 	}

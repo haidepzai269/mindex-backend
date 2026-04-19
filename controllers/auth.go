@@ -24,11 +24,8 @@ func generateOTP() string {
 	return fmt.Sprintf("%06d", n.Int64()+100000)
 }
 
-func setTokenCookies(c *gin.Context, access, refresh string) {
-	// Kiểm tra xem có đang chạy ở production không (đơn giản là check domain không phải localhost)
-	// Hoặc dựa vào config nếu có. Ở đây ta ưu tiên Secure=true và SameSite=None cho HTTPS.
-	
-	// Access Token: 15 phút (khớp với JWT)
+func setTokenCookies(c *gin.Context, access, refresh string, rememberMe bool) {
+	// 1. Access Token: 15 phút (khớp với JWT)
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     "access_token",
 		Value:    access,
@@ -40,12 +37,17 @@ func setTokenCookies(c *gin.Context, access, refresh string) {
 		SameSite: http.SameSiteNoneMode,
 	})
 
-	// Refresh Token: 7 ngày
+	// 2. Refresh Token
 	if refresh != "" {
+		maxAge := 7 * 24 * 3600 // Mặc định 7 ngày
+		if rememberMe {
+			maxAge = 10 * 24 * 3600 // 10 ngày nếu chọn Remember Me
+		}
+
 		http.SetCookie(c.Writer, &http.Cookie{
 			Name:     "refresh_token",
 			Value:    refresh,
-			MaxAge:   7 * 24 * 3600,
+			MaxAge:   maxAge,
 			Path:     "/",
 			Domain:   "",
 			Secure:   true,
@@ -63,8 +65,9 @@ type RegisterReq struct {
 }
 
 type LoginReq struct {
-	Email    string `json:"email" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Email      string `json:"email" binding:"required"`
+	Password   string `json:"password" binding:"required"`
+	RememberMe bool   `json:"remember_me"`
 }
 
 func Register(c *gin.Context) {
@@ -107,7 +110,7 @@ func Register(c *gin.Context) {
 
 	access, refresh, _ := utils.GenerateTokenPair(userID, "user", personaVal)
 
-	setTokenCookies(c, access, refresh)
+	setTokenCookies(c, access, refresh, false)
 
 	c.JSON(201, gin.H{
 		"success": true,
@@ -149,13 +152,22 @@ func Login(c *gin.Context) {
 
 	access, refresh, _ := utils.GenerateTokenPair(user.ID, user.Role, user.Persona)
 
-	setTokenCookies(c, access, refresh)
+	// Xử lý Redis Session nếu chọn Remember Me
+	if req.RememberMe && config.RedisClient != nil {
+		// Lưu session vào Redis với TTL 10 ngày
+		// Key: session:<user_id>, Value: refresh_token (để verify nếu cần)
+		sessionKey := fmt.Sprintf("session:%s", user.ID)
+		config.RedisClient.Set(config.Ctx, sessionKey, refresh, 10*24*time.Hour)
+	}
+
+	setTokenCookies(c, access, refresh, req.RememberMe)
 
 	c.JSON(200, gin.H{
 		"success": true,
 		"data": gin.H{
 			"access_token":  access,
 			"refresh_token": refresh,
+			"remember_me":   req.RememberMe,
 			"user": gin.H{
 				"id":         user.ID,
 				"name":       user.Name,
@@ -604,6 +616,12 @@ func Logout(c *gin.Context) {
 		SameSite: http.SameSiteNoneMode,
 	})
 
+	// 4. Xóa session trong Redis nếu có
+	userID := c.GetString("user_id")
+	if userID != "" && config.RedisClient != nil {
+		config.RedisClient.Del(config.Ctx, fmt.Sprintf("session:%s", userID))
+	}
+
 	c.JSON(200, gin.H{
 		"success": true,
 		"message": "Đã đăng xuất và vô hiệu hóa phiên làm việc",
@@ -723,7 +741,7 @@ func GoogleLogin(c *gin.Context) {
 
 	// 3. Tạo JWT & Set Cookie
 	access, refresh, _ := utils.GenerateTokenPair(user.ID, user.Role, user.Persona)
-	setTokenCookies(c, access, refresh)
+	setTokenCookies(c, access, refresh, true)
 
 	c.JSON(200, gin.H{
 		"success": true,
