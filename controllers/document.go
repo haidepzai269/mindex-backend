@@ -48,6 +48,7 @@ func GetMyDocuments(c *gin.Context) {
 		FROM documents d
 		JOIN document_references dr ON d.id = dr.document_id
 		WHERE dr.user_id = $1
+		  AND (d.expired_at IS NULL OR d.expired_at > NOW())
 		ORDER BY COALESCE(d.shared_at, d.created_at) DESC, d.created_at DESC`,
 		userID,
 	)
@@ -62,13 +63,13 @@ func GetMyDocuments(c *gin.Context) {
 	for rows.Next() {
 		var d DocumentItem
 		err := rows.Scan(
-			&d.ID, 
-			&d.Title, 
-			&d.Status, 
-			&d.CreatedAt, 
+			&d.ID,
+			&d.Title,
+			&d.Status,
+			&d.CreatedAt,
 			&d.SharedAt,
-			&d.ExpiredAt, 
-			&d.Pinned, 
+			&d.ExpiredAt,
+			&d.Pinned,
 			&d.IsPublic,
 			&d.ChunkCount,
 		)
@@ -132,13 +133,13 @@ func GetDocumentDetail(c *gin.Context) {
 		  AND (d.expired_at IS NULL OR d.expired_at > NOW())`,
 		docID, userID,
 	).Scan(
-		&d.ID, 
-		&d.Title, 
-		&d.Status, 
-		&d.CreatedAt, 
+		&d.ID,
+		&d.Title,
+		&d.Status,
+		&d.CreatedAt,
 		&d.SharedAt,
-		&d.ExpiredAt, 
-		&d.Pinned, 
+		&d.ExpiredAt,
+		&d.Pinned,
 		&d.IsPublic,
 		&d.ChunkCount,
 	)
@@ -168,39 +169,39 @@ func TogglePinDocument(c *gin.Context) {
 		return
 	}
 
-		// 1. Kiểm tra Quota nếu là hành động Ghim
-		if req.Pinned {
-			var pinnedCount int
-			var tier string
-			err := config.DB.QueryRow(config.Ctx, `
+	// 1. Kiểm tra Quota nếu là hành động Ghim
+	if req.Pinned {
+		var pinnedCount int
+		var tier string
+		err := config.DB.QueryRow(config.Ctx, `
 				SELECT 
 					(SELECT COUNT(*) FROM document_references WHERE user_id = $1 AND pinned = TRUE),
 					COALESCE(tier, 'FREE')
 				FROM users WHERE id = $1`,
-				userID,
-			).Scan(&pinnedCount, &tier)
+			userID,
+		).Scan(&pinnedCount, &tier)
 
-			if err != nil {
-				c.JSON(500, gin.H{"success": false, "message": "Lỗi kiểm tra quota"})
-				return
-			}
-
-			limit := 3
-			if tier == "PRO" {
-				limit = 5
-			} else if tier == "ULTRA" {
-				limit = 10
-			}
-
-			if pinnedCount >= limit {
-				c.JSON(403, gin.H{
-					"success": false,
-					"error":   "PIN_QUOTA_EXCEEDED",
-					"message": fmt.Sprintf("Bạn đã ghim tối đa %d tài liệu. Hãy bỏ ghim tài liệu cũ để tiếp tục.", limit),
-				})
-				return
-			}
+		if err != nil {
+			c.JSON(500, gin.H{"success": false, "message": "Lỗi kiểm tra quota"})
+			return
 		}
+
+		limit := 3
+		if tier == "PRO" {
+			limit = 5
+		} else if tier == "ULTRA" {
+			limit = 10
+		}
+
+		if pinnedCount >= limit {
+			c.JSON(403, gin.H{
+				"success": false,
+				"error":   "PIN_QUOTA_EXCEEDED",
+				"message": fmt.Sprintf("Bạn đã ghim tối đa %d tài liệu. Hãy bỏ ghim tài liệu cũ để tiếp tục.", limit),
+			})
+			return
+		}
+	}
 
 	// 2. Cập nhật trạng thái Ghim trong references (Sử dụng UPSERT để đảm bảo)
 	_, err := config.DB.Exec(config.Ctx, `
@@ -219,7 +220,7 @@ func TogglePinDocument(c *gin.Context) {
 	if req.Pinned {
 		// Nếu ghim -> Xóa ngày hết hạn (Lưu vĩnh viễn)
 		_, _ = config.DB.Exec(config.Ctx, `
-			UPDATE documents SET expired_at = NULL WHERE id = $1`, 
+			UPDATE documents SET expired_at = NULL WHERE id = $1`,
 			docID,
 		)
 	} else {
@@ -227,7 +228,7 @@ func TogglePinDocument(c *gin.Context) {
 		var othersPinned int
 		config.DB.QueryRow(config.Ctx, `
 			SELECT COUNT(*) FROM document_references 
-			WHERE document_id = $1 AND pinned = TRUE`, 
+			WHERE document_id = $1 AND pinned = TRUE`,
 			docID,
 		).Scan(&othersPinned)
 
@@ -236,7 +237,7 @@ func TogglePinDocument(c *gin.Context) {
 			_, _ = config.DB.Exec(config.Ctx, `
 				UPDATE documents 
 				SET expired_at = NOW() + INTERVAL '24 hours' 
-				WHERE id = $1`, 
+				WHERE id = $1`,
 				docID,
 			)
 		}
@@ -253,9 +254,9 @@ func TogglePinDocument(c *gin.Context) {
 	_ = utils.PublishNotification(userID, "quota_update", "Cập nhật giới hạn", "Trạng thái ghim đã thay đổi", nil)
 
 	c.JSON(200, gin.H{
-		"success": true, 
+		"success": true,
 		"message": map[bool]string{true: "Đã ghim tài liệu", false: "Đã bỏ ghim tài liệu"}[req.Pinned],
-		"data": gin.H{"pinned": req.Pinned},
+		"data":    gin.H{"pinned": req.Pinned},
 	})
 }
 
@@ -288,7 +289,7 @@ func DeleteDocument(c *gin.Context) {
 	// 3. Kiểm tra xem còn bất kỳ ai tham chiếu đến tài liệu này không
 	var refCount int
 	err = config.DB.QueryRow(config.Ctx, `
-		SELECT COUNT(*) FROM document_references WHERE document_id = $1`, 
+		SELECT COUNT(*) FROM document_references WHERE document_id = $1`,
 		docID,
 	).Scan(&refCount)
 
@@ -313,10 +314,11 @@ func DeleteDocument(c *gin.Context) {
 	_ = utils.PublishNotification(userID, "quota_update", "Cập nhật dữ liệu", "Tài liệu đã được xóa", nil)
 
 	c.JSON(200, gin.H{
-		"success": true, 
+		"success": true,
 		"message": "Đã xóa tài liệu khỏi thư viện của bạn",
 	})
 }
+
 // UpdateDocumentPersona cập nhật lĩnh vực của tài liệu (manual override)
 func UpdateDocumentPersona(c *gin.Context) {
 	userID := c.GetString("user_id")

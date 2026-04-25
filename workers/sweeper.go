@@ -8,14 +8,17 @@ import (
 	"time"
 )
 
-// StartSweeper là Cronjob dọn dẹp chạy mỗi 3:00 AM
-func StartSweeper() {
-	log.Println("🛠 Khởi chạy Cronjob Sweeper (Run at 3:00 AM)...")
+const sweeperInterval = 1 * time.Minute
 
-	// Chúng ta sẽ chạy ngầm kiểm tra mỗi giờ để mô phỏng
-	// Trong thực tế sẽ tính toán Next 3AM và dùng time.Sleep(time.Until(next3AM))
+// StartSweeper chạy định kỳ để dọn dẹp tài liệu đã hết hạn
+func StartSweeper() {
+	log.Printf("🛠 Khởi chạy Sweeper (chu kỳ %s)...", sweeperInterval)
+
+	RunSweeperNow()
+
 	go func() {
-		ticker := time.NewTicker(1 * time.Hour)
+		ticker := time.NewTicker(sweeperInterval)
+		defer ticker.Stop()
 		for range ticker.C {
 			RunSweeperNow()
 		}
@@ -27,23 +30,29 @@ func RunSweeperNow() (map[string]interface{}, error) {
 
 	// 1. Lấy danh sách các tài liệu sắp bị xóa để gửi thông báo
 	rows, err := config.DB.Query(config.Ctx, `
-		SELECT id, user_id, title 
-		FROM documents 
-		WHERE expired_at IS NOT NULL AND expired_at < NOW()`)
-	
+		SELECT d.id, dr.user_id, d.title, d.is_public
+		FROM documents d
+		JOIN document_references dr ON dr.document_id = d.id
+		WHERE d.expired_at IS NOT NULL AND d.expired_at < NOW()`)
+
 	type delDoc struct {
-		ID     string
-		UserID string
-		Title  string
+		ID       string
+		UserID   string
+		Title    string
+		IsPublic bool
 	}
 	var toDelete []delDoc
+	shouldClearCommunity := false
 
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var d delDoc
-			if err := rows.Scan(&d.ID, &d.UserID, &d.Title); err == nil {
+			if err := rows.Scan(&d.ID, &d.UserID, &d.Title, &d.IsPublic); err == nil {
 				toDelete = append(toDelete, d)
+				if d.IsPublic {
+					shouldClearCommunity = true
+				}
 			}
 		}
 	}
@@ -70,13 +79,19 @@ func RunSweeperNow() (map[string]interface{}, error) {
 	// 3. Gửi thông báo cho từng người dùng (Background)
 	go func() {
 		for _, d := range toDelete {
+			utils.ClearUserCache("docs", d.UserID)
+			utils.ClearUserCache("collections", d.UserID)
 			utils.PublishNotification(
-				d.UserID, 
-				"document_deleted", 
-				"Tài liệu đã được dọn dẹp", 
+				d.UserID,
+				"document_deleted",
+				"Tài liệu đã được dọn dẹp",
 				fmt.Sprintf("Tài liệu \"%s\" đã được dọn dẹp hệ thống sau khi hết hạn.", d.Title),
 				map[string]string{"doc_id": d.ID},
 			)
+		}
+
+		if shouldClearCommunity {
+			utils.ClearCommunityCache()
 		}
 	}()
 
