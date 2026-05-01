@@ -96,10 +96,32 @@ func InitOrchestrator() {
 }
 
 // ChatStream thực hiện gọi stream chat với cơ chế fallback
-func (o *AIOrchestrator) ChatStream(service ServiceType, c *gin.Context, messages []ChatMessage) (string, ProviderType, error) {
+func (o *AIOrchestrator) ChatStream(service ServiceType, c *gin.Context, messages []ChatMessage, modelOverride string) (string, ProviderType, error) {
 	configs := o.Priorities[service]
-	var lastErr error
 
+	// Nếu là Chat và có modelOverride, ta ưu tiên NineRouter với model được yêu cầu
+	if service == ServiceChat && modelOverride != "" {
+		var modelToUse string
+		if modelOverride == "Mindex-2" {
+			modelToUse = config.Env.NineRouterChatModel // Model2
+		} else {
+			modelToUse = config.Env.NineRouterModel // Model1 (Mindex-1 hoặc mặc định)
+		}
+
+		// Tạo danh sách config mới với NineRouter model đúng ở đầu
+		newConfigs := []AIProviderConfig{
+			{Type: ProviderNineRouter, Model: modelToUse, Pool: NineRouterChatPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
+		}
+		// Thêm các fallback còn lại (loại bỏ NineRouter cũ để tránh trùng lặp)
+		for _, cfg := range configs {
+			if cfg.Type != ProviderNineRouter {
+				newConfigs = append(newConfigs, cfg)
+			}
+		}
+		configs = newConfigs
+	}
+
+	var lastErr error
 	for _, cfg := range configs {
 		// Kiểm tra pool có sẵn không
 		if cfg.Pool == nil || len(cfg.Pool.keys) == 0 {
@@ -116,8 +138,6 @@ func (o *AIOrchestrator) ChatStream(service ServiceType, c *gin.Context, message
 		} else if cfg.Type == ProviderGemini {
 			answer, err = StreamGeminiChatWithModel(c, messages, cfg.Model)
 		} else if cfg.Type == ProviderHF {
-			// HuggingFace for Search rewrite usually non-stream, 
-			// but we can wrap it if needed. For now skip as primary chat.
 			continue
 		}
 
@@ -129,7 +149,6 @@ func (o *AIOrchestrator) ChatStream(service ServiceType, c *gin.Context, message
 		lastErr = err
 		log.Printf("⚠️ [Orchestrator] [%s] Provider %s lỗi: %v. Đang fallback...", service, cfg.Type, err)
 		
-		// Nếu client đã ngắt kết nối thì dừng luôn
 		if strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "context canceled") {
 			return answer, cfg.Type, err
 		}

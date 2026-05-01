@@ -22,6 +22,7 @@ type ChatRequest struct {
 	Question      string `json:"question" binding:"required"`
 	UseSystemDocs bool   `json:"use_system_docs"`
 	ForkID        string `json:"fork_id"` // ID của shared_link nếu đây là fork session
+	Model         string `json:"model"`   // Mindex-1 hoặc Mindex-2
 }
 
 type QAHistory struct {
@@ -38,6 +39,7 @@ func ChatMessage(c *gin.Context) {
 		req.SessionID = c.Query("session_id")
 		req.UseSystemDocs = c.Query("system") == "true"
 		req.ForkID = c.Query("fork_id")
+		req.Model = c.Query("model")
 	} else {
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(400, gin.H{"success": false, "error": "VALIDATION_ERROR", "message": "Tham số không hợp lệ"})
@@ -312,7 +314,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 	log.Printf("🚀 [CHAT] Đang gửi yêu cầu tới AI Orchestrator cho session: %s", req.SessionID)
 	chatStart := time.Now()
 	
-	fullAnswer, usedProvider, streamErr := utils.AI.ChatStream(utils.ServiceChat, c, messages)
+	fullAnswer, usedProvider, streamErr := utils.AI.ChatStream(utils.ServiceChat, c, messages, req.Model)
 	
 	chatLatency := int(time.Since(chatStart).Milliseconds())
 

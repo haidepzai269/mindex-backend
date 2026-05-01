@@ -126,6 +126,9 @@ func LoadConfig() {
 		for _, v := range parts {
 			nineRouterChatKeys = append(nineRouterChatKeys, strings.TrimSpace(v))
 		}
+	} else {
+		// Fallback dùng chung key nếu không có chat key riêng
+		nineRouterChatKeys = nineRouterKeys
 	}
 
 	Env = AppConfig{

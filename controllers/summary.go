@@ -203,7 +203,7 @@ func DetailedSummary(c *gin.Context) {
 	}
 
 	summaryStart := time.Now()
-	finalAnswer, usedProvider, err := utils.AI.ChatStream(utils.ServiceSummary, c, messages)
+	finalAnswer, usedProvider, err := utils.AI.ChatStream(utils.ServiceSummary, c, messages, "")
 	summaryLatency := int(time.Since(summaryStart).Milliseconds())
 
 	if err == nil && finalAnswer != "" {
