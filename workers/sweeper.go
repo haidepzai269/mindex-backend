@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-const sweeperInterval = 1 * time.Minute
+const sweeperInterval = 1 * time.Hour
 
 // StartSweeper chạy định kỳ để dọn dẹp tài liệu đã hết hạn
 func StartSweeper() {

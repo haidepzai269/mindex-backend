@@ -18,13 +18,20 @@ import (
 // ─── Free/Pro Quota Gate ─────────────────────────────────────────────────────
 
 const (
-	FreeFlashcardLimit = 20 // max card/doc cho free user
-	FreeQuizDailyLimit = 1  // max quiz generation/ngày cho free user
+	FreeFlashcardLimit  = 20 // max card/doc cho free user
+	FreeQuizDailyLimit  = 1  // max quiz/ngày cho free
+	ProQuizDailyLimit   = 3  // max quiz/ngày cho pro
+	UltraQuizDailyLimit = 10 // max quiz/ngày cho ultra
+
+	// Flashcard Daily Quota (số lần tạo bộ thẻ mới mỗi ngày)
+	FreeFlashcardDailyQuota  = 2
+	ProFlashcardDailyQuota   = 5
+	UltraFlashcardDailyQuota = 8
 )
 
-// checkAndIncrementQuota kiểm tra và tăng quota học tập của user (1 quiz/ngày)
+// checkStudyQuota kiểm tra và tăng quota học tập của user
 // Trả về (allowed, currentCount, error)
-func checkStudyQuota(userID, quotaType string) (bool, int, error) {
+func checkStudyQuota(userID, quotaType string, maxLimit int) (bool, int, error) {
 	ctx := context.Background()
 
 	// Reset quota nếu sang ngày mới
@@ -52,11 +59,19 @@ func checkStudyQuota(userID, quotaType string) (bool, int, error) {
 		Scan(&quizCount, &flashCount)
 
 	if quotaType == "quiz" {
-		if quizCount >= FreeQuizDailyLimit {
+		if quizCount >= maxLimit {
 			return false, quizCount, nil
 		}
 		config.DB.Exec(ctx, `UPDATE study_quota SET quiz_gens_today = quiz_gens_today + 1 WHERE user_id = $1`, userID)
 		return true, quizCount + 1, nil
+	}
+
+	if quotaType == "flashcard" {
+		if flashCount >= maxLimit {
+			return false, flashCount, nil
+		}
+		config.DB.Exec(ctx, `UPDATE study_quota SET flashcard_gens_today = flashcard_gens_today + 1 WHERE user_id = $1`, userID)
+		return true, flashCount + 1, nil
 	}
 
 	// flashcard: không giới hạn lần tạo, chỉ giới hạn số card
@@ -70,7 +85,52 @@ func checkStudyQuota(userID, quotaType string) (bool, int, error) {
 func GenerateFlashcards(c *gin.Context) {
 	userID := c.GetString("user_id")
 	docID := c.Param("doc_id")
-	tier := c.GetString("tier") // "free" hoặc "pro"
+
+	// 1. Kiểm tra giới hạn: Tối đa 2 lần tạo/tài liệu (bất kể user nào)
+	var existingSets int
+	config.DB.QueryRow(config.Ctx, `SELECT COUNT(*) FROM flashcard_sets WHERE doc_id = $1`, docID).Scan(&existingSets)
+	if existingSets >= 2 {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error": "LIMIT_REACHED", 
+			"message": "Tài liệu này đã đạt giới hạn 2 lần tạo Flashcard. Vui lòng sử dụng các bộ thẻ đã có.",
+		})
+		return
+	}
+
+	// 2. Nhận số lượng thẻ yêu cầu
+	var req struct {
+		NumCards int `json:"num_cards"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.NumCards == 0 {
+		req.NumCards = 20 // mặc định
+	}
+
+	// Lấy tier trực tiếp từ DB
+	var tier string
+	config.DB.QueryRow(config.Ctx, `SELECT COALESCE(tier, 'FREE') FROM users WHERE id = $1`, userID).Scan(&tier)
+	tier = strings.ToLower(tier)
+
+	// 3. Kiểm tra Daily Quota cho Flashcard (Free: 2, Pro: 5, Ultra: 8)
+	fcLimit := FreeFlashcardDailyQuota
+	if tier == "pro" {
+		fcLimit = ProFlashcardDailyQuota
+	} else if tier == "ultra" {
+		fcLimit = UltraFlashcardDailyQuota
+	}
+
+	allowed, fcCount, err := checkStudyQuota(userID, "flashcard", fcLimit)
+	if err != nil {
+		log.Printf("⚠️ [Flashcard] Daily quota check error: %v", err)
+	}
+	if !allowed {
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error":      "DAILY_LIMIT_REACHED",
+			"message":    fmt.Sprintf("Bạn đã dùng hết hạn mức tạo flashcard hôm nay (%d/%d lần). Vui lòng quay lại vào ngày mai!", fcCount, fcLimit),
+			"quota_used": fcCount,
+			"quota_max":  fcLimit,
+		})
+		return
+	}
 
 	// Lấy top chunks của doc để làm ngữ liệu
 	rows, err := config.DB.Query(config.Ctx, `
@@ -105,9 +165,9 @@ func GenerateFlashcards(c *gin.Context) {
 		combinedText = combinedText[:8000]
 	}
 
-	// Quyết định max card dựa trên tier
-	maxCards := 20
-	if tier == "pro" || tier == "ultra" {
+	// Quyết định max card dựa trên yêu cầu (tối đa 50)
+	maxCards := req.NumCards
+	if maxCards > 50 {
 		maxCards = 50
 	}
 
@@ -128,12 +188,42 @@ Yêu cầu:
 		{Role: "user", Content: fmt.Sprintf("Tài liệu: %s\n\nNội dung:\n%s", docTitle, combinedText)},
 	}
 
-	// Dùng NineRouter → fallback Groq 70B
-	fcMessages := []utils.ChatMessage{}
-	fcMessages = append(fcMessages, messages...)
+	// Quyết định fallback sequence: Model1 (NineRouter) -> Groq -> Gemini
+	var rawJSON string
+	var fallbackErr error
 
-	rawJSON, _, err := utils.AI.ChatNonStream(utils.ServiceClassify, fcMessages)
-	if err != nil {
+	// 1. Thử NineRouter (Model 1)
+	log.Printf("🌐 [Flashcard] Thử Provider: Model1 (NineRouter)")
+	cfgNR := utils.AIProviderConfig{
+		Type:     utils.ProviderNineRouter,
+		Model:    config.Env.NineRouterModel,
+		Pool:     utils.NineRouterPool,
+		IsOpenAI: true,
+		BaseURL:  config.Env.NineRouterBaseURL,
+	}
+	rawJSON, fallbackErr = utils.ChatOpenAINonStream(cfgNR, messages)
+
+	// 2. Nếu lỗi hoặc kết quả rỗng, thử Groq
+	if fallbackErr != nil || rawJSON == "" {
+		log.Printf("⚠️ [Flashcard] Model1 lỗi hoặc trả về rỗng: %v. Thử Provider: Groq", fallbackErr)
+		cfgGroq := utils.AIProviderConfig{
+			Type:     utils.ProviderGroq,
+			Model:    "llama-3.3-70b-versatile",
+			Pool:     utils.GroqPool,
+			IsOpenAI: true,
+			BaseURL:  "https://api.groq.com/openai/v1",
+		}
+		rawJSON, fallbackErr = utils.ChatOpenAINonStream(cfgGroq, messages)
+	}
+
+	// 3. Nếu vẫn lỗi hoặc kết quả rỗng, thử Gemini
+	if fallbackErr != nil || rawJSON == "" {
+		log.Printf("⚠️ [Flashcard] Groq lỗi hoặc trả về rỗng: %v. Thử Provider: Gemini", fallbackErr)
+		rawJSON, fallbackErr = utils.GeminiChatNonStreamWithModel(messages, "gemini-2.0-flash-exp")
+	}
+
+	if fallbackErr != nil || rawJSON == "" {
+		log.Printf("❌ [Flashcard] Tất cả Provider đều lỗi hoặc trả về rỗng: %v", fallbackErr)
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI không thể tạo flashcard lúc này, vui lòng thử lại"})
 		return
 	}
@@ -192,6 +282,12 @@ Yêu cầu:
 	}
 
 	log.Printf("✅ [Flashcard] Generated %d cards for doc %s (user: %s)", len(cards), docID, userID)
+	
+	// Xóa cache danh sách bộ thẻ của doc này trong Redis (nếu có)
+	if config.RedisClient != nil {
+		config.RedisClient.Del(config.Ctx, "doc_flashcard_sets:"+docID)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"success":  true,
 		"set_id":   setID,
@@ -234,13 +330,24 @@ func GetFlashcardSets(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": sets})
 }
 
-// GetFlashcards lấy tất cả flashcards trong một set
+// GetFlashcards lấy tất cả flashcards trong một set (có dùng Redis cache)
 // GET /api/study/flashcards/:set_id
 func GetFlashcards(c *gin.Context) {
 	userID := c.GetString("user_id")
 	setID := c.Param("set_id")
 
-	// Kiểm tra quyền: set phải thuộc user này
+	// Thử lấy từ Redis trước
+	cacheKey := "flashcards_set:" + setID
+	if config.RedisClient != nil {
+		cached, err := config.RedisClient.Get(config.Ctx, cacheKey).Result()
+		if err == nil {
+			log.Printf("🚀 [Flashcard] Cache hit for set %s", setID)
+			c.Data(http.StatusOK, "application/json", []byte(cached))
+			return
+		}
+	}
+
+	// Kiểm tra quyền: set phải thuộc user này (hoặc có quyền xem tài liệu)
 	var ownerID string
 	config.DB.QueryRow(config.Ctx, `SELECT user_id FROM flashcard_sets WHERE id = $1`, setID).Scan(&ownerID)
 	if ownerID != userID {
@@ -276,6 +383,12 @@ func GetFlashcards(c *gin.Context) {
 		cards = append(cards, card)
 	}
 
+	// Lưu vào Redis cache (hết hạn sau 1 giờ hoặc tùy chỉnh)
+	if config.RedisClient != nil {
+		jsonData, _ := json.Marshal(gin.H{"success": true, "data": cards})
+		config.RedisClient.Set(config.Ctx, cacheKey, jsonData, 1*time.Hour)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": cards})
 }
 
@@ -300,11 +413,22 @@ func MarkFlashcard(c *gin.Context) {
 		return
 	}
 
+	// 1. Lấy set_id để xóa cache
+	var setID string
+	config.DB.QueryRow(config.Ctx, `SELECT set_id FROM flashcards WHERE id = $1`, cardID).Scan(&setID)
+
+	// 2. Cập nhật vào DB
 	_, err := config.DB.Exec(config.Ctx,
 		`UPDATE flashcards SET remembered = $1 WHERE id = $2`, req.Remembered, cardID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể cập nhật"})
 		return
+	}
+
+	// 3. XÓA CACHE REDIS để lần load sau lấy dữ liệu mới
+	if config.RedisClient != nil && setID != "" {
+		config.RedisClient.Del(config.Ctx, "flashcards_set:"+setID)
+		log.Printf("🧹 [Flashcard] Invalidated cache for set %s due to mark", setID)
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true})
@@ -324,23 +448,32 @@ type QuizConfig struct {
 func GenerateQuiz(c *gin.Context) {
 	userID := c.GetString("user_id")
 	docID := c.Param("doc_id")
-	tier := c.GetString("tier")
 
-	// 1. Kiểm tra quota (1 quiz/ngày cho free user)
-	if tier == "free" || tier == "" {
-		allowed, count, err := checkStudyQuota(userID, "quiz")
-		if err != nil {
-			log.Printf("⚠️ [Quiz] Quota check error for user %s: %v", userID, err)
-		}
-		if !allowed {
-			c.JSON(http.StatusTooManyRequests, gin.H{
-				"error":      "QUOTA_EXCEEDED",
-				"message":    fmt.Sprintf("Bạn đã tạo %d quiz hôm nay. Hạn mức free là %d quiz/ngày. Nâng cấp Pro để tạo không giới hạn!", count, FreeQuizDailyLimit),
-				"quota_used": count,
-				"quota_max":  FreeQuizDailyLimit,
-			})
-			return
-		}
+	// Lấy tier trực tiếp từ DB và chuẩn hóa chữ thường
+	var tier string
+	config.DB.QueryRow(config.Ctx, `SELECT COALESCE(tier, 'FREE') FROM users WHERE id = $1`, userID).Scan(&tier)
+	tier = strings.ToLower(tier)
+
+	// 1. Kiểm tra quota (Free: 1, Pro: 3, Ultra: 10)
+	limit := FreeQuizDailyLimit
+	if tier == "pro" {
+		limit = ProQuizDailyLimit
+	} else if tier == "ultra" {
+		limit = UltraQuizDailyLimit
+	}
+
+	allowed, count, err := checkStudyQuota(userID, "quiz", limit)
+	if err != nil {
+		log.Printf("⚠️ [Quiz] Quota check error for user %s: %v", userID, err)
+	}
+	if !allowed {
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error":      "QUOTA_EXCEEDED",
+			"message":    fmt.Sprintf("Bạn đã đạt giới hạn tạo quiz (%d/%d lần/ngày). Nâng cấp gói cao hơn để có thêm lượt!", count, limit),
+			"quota_used": count,
+			"quota_max":  limit,
+		})
+		return
 	}
 
 	// 2. Đọc config từ body
