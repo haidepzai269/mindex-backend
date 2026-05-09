@@ -130,6 +130,14 @@ func handleRoomIncomingMessage(client *ws.RoomClient, roomID, userID string, raw
 			go handleRoomAI(roomID, userID, parsed.CleanForRAG)
 		}
 
+	case "typing":
+		var userName string
+		config.DB.QueryRow(config.Ctx, `SELECT name FROM users WHERE id = $1`, userID).Scan(&userName)
+		ws.RoomHubInstance.BroadcastToRoomExcept(roomID, userID, models.RoomEvent{
+			Type: "user_typing", RoomID: roomID, UserID: userID,
+			Payload: gin.H{"user_id": userID, "name": userName},
+		})
+
 	case "message_reaction":
 		var reactReq struct {
 			MessageID string `json:"message_id"`

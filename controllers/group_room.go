@@ -540,7 +540,7 @@ func getRoomDetail(roomID string) *models.GroupRoom {
 	room.InviteLink = fmt.Sprintf("https://mindex.io.vn/rooms/join?code=%s", room.InviteCode)
 
 	rows, _ := config.DB.Query(config.Ctx, `
-		SELECT grm.user_id, u.name, grm.joined_at, grm.is_host,
+		SELECT grm.user_id, u.name, COALESCE(u.avatar_url, ''), grm.joined_at, grm.is_host,
 		    (SELECT COUNT(*) FROM (
 		        SELECT d.id FROM documents d WHERE d.room_id = $1 AND d.user_id = grm.user_id
 		        UNION
@@ -554,7 +554,7 @@ func getRoomDetail(roomID string) *models.GroupRoom {
 		defer rows.Close()
 		for rows.Next() {
 			var m models.GroupRoomMember
-			rows.Scan(&m.UserID, &m.Name, &m.JoinedAt, &m.IsHost, &m.DocCount)
+			rows.Scan(&m.UserID, &m.Name, &m.AvatarURL, &m.JoinedAt, &m.IsHost, &m.DocCount)
 			m.RoomID = roomID
 
 			// Lấy LastSeen từ Redis

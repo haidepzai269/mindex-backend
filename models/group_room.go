@@ -21,16 +21,17 @@ type GroupRoom struct {
 
 // GroupRoomMember đại diện thông tin 1 thành viên trong phòng
 type GroupRoomMember struct {
-	RoomID   string     `json:"room_id"`
-	UserID   string     `json:"user_id"`
-	Name     string     `json:"name"`
-	Email    string     `json:"email,omitempty"`
-	JoinedAt time.Time  `json:"joined_at"`
-	LeftAt   *time.Time `json:"left_at,omitempty"`
-	DocCount int        `json:"doc_count"`
-	IsHost   bool       `json:"is_host"`
-	IsOnline bool       `json:"is_online"` // computed từ Redis heartbeat
-	LastSeen *time.Time `json:"last_seen,omitempty"`
+	RoomID    string     `json:"room_id"`
+	UserID    string     `json:"user_id"`
+	Name      string     `json:"name"`
+	Email     string     `json:"email,omitempty"`
+	AvatarURL string     `json:"avatar_url,omitempty"`
+	JoinedAt  time.Time  `json:"joined_at"`
+	LeftAt    *time.Time `json:"left_at,omitempty"`
+	DocCount  int        `json:"doc_count"`
+	IsHost    bool       `json:"is_host"`
+	IsOnline  bool       `json:"is_online"` // computed từ Redis heartbeat
+	LastSeen  *time.Time `json:"last_seen,omitempty"`
 }
 
 // RoomDocument tài liệu trong phòng (có thêm owner info)
