@@ -128,7 +128,12 @@ func InitiateUpload(c *gin.Context) {
 			return
 		}
 		var docCount int
-		config.DB.QueryRow(config.Ctx, `SELECT doc_count FROM group_room_members WHERE room_id = $1 AND user_id = $2`, roomID, userID).Scan(&docCount)
+		config.DB.QueryRow(config.Ctx, `
+			SELECT COUNT(*) FROM (
+				SELECT d.id FROM documents d WHERE d.room_id = $1 AND d.user_id = $2
+				UNION
+				SELECT l.document_id FROM group_room_doc_links l WHERE l.room_id = $1 AND l.linked_by = $2
+			) sub`, roomID, userID).Scan(&docCount)
 		if docCount >= 3 {
 			c.JSON(403, gin.H{"success": false, "error": "ROOM_DOC_LIMIT", "message": "Tối đa 3 tài liệu/người trong một phòng."})
 			return

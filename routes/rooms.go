@@ -20,6 +20,7 @@ func RegisterRoomRoutes(rg *gin.RouterGroup) {
 		rooms.POST("/:id/leave", controllers.LeaveRoom)
 		rooms.POST("/:id/close", controllers.CloseRoom)
 		rooms.GET("/:id/docs", controllers.GetRoomDocs)
+		rooms.POST("/:id/docs/link", controllers.LinkDocToRoom)
 		
 		// WebSocket for group chat
 		rooms.GET("/:id/ws", controllers.ConnectRoomWS)

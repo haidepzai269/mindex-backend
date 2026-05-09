@@ -371,7 +371,16 @@ func GetRoomDocs(c *gin.Context) {
 		FROM documents d
 		JOIN users u ON d.user_id = u.id
 		WHERE d.room_id = $1
-		ORDER BY d.created_at ASC`, roomID)
+
+		UNION
+
+		SELECT d.id, d.title, d.status, d.user_id, u.name, l.linked_at
+		FROM group_room_doc_links l
+		JOIN documents d ON l.document_id = d.id
+		JOIN users u ON d.user_id = u.id
+		WHERE l.room_id = $1
+
+		ORDER BY created_at ASC`, roomID)
 	if err != nil {
 		log.Printf("❌ [GetRoomDocs] Query error: %v", err)
 		c.JSON(500, gin.H{"success": false, "message": "Lỗi truy vấn"})
@@ -390,6 +399,83 @@ func GetRoomDocs(c *gin.Context) {
 		docs = []models.RoomDocument{}
 	}
 	c.JSON(200, gin.H{"success": true, "data": docs})
+}
+
+// LinkDocToRoom — POST /api/v1/rooms/:id/docs/link
+// Liên kết tài liệu có sẵn trong thư viện vào phòng (không cần upload lại)
+func LinkDocToRoom(c *gin.Context) {
+	userID := c.GetString("user_id")
+	roomID := c.Param("id")
+
+	var req struct {
+		DocumentID string `json:"document_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"success": false, "error": "VALIDATION_ERROR", "message": "document_id là bắt buộc"})
+		return
+	}
+
+	// 1. Kiểm tra user là member active
+	if !IsRoomMember(roomID, userID) {
+		c.JSON(403, gin.H{"success": false, "error": "NOT_MEMBER", "message": "Bạn không phải thành viên của phòng này"})
+		return
+	}
+
+	// 2. Kiểm tra tài liệu tồn tại và thuộc user, đã ready
+	var docTitle, docStatus string
+	err := config.DB.QueryRow(config.Ctx, `
+		SELECT title, status FROM documents
+		WHERE id = $1 AND user_id = $2`,
+		req.DocumentID, userID).Scan(&docTitle, &docStatus)
+	if err != nil {
+		c.JSON(404, gin.H{"success": false, "error": "DOC_NOT_FOUND", "message": "Không tìm thấy tài liệu hoặc không có quyền"})
+		return
+	}
+	if docStatus != "ready" {
+		c.JSON(400, gin.H{"success": false, "error": "DOC_NOT_READY", "message": "Tài liệu chưa sẵn sàng (đang xử lý hoặc lỗi)"})
+		return
+	}
+
+	// 3. Kiểm tra chưa được link vào phòng này
+	var alreadyLinked bool
+	config.DB.QueryRow(config.Ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM group_room_doc_links
+			WHERE room_id = $1 AND document_id = $2
+		)`, roomID, req.DocumentID).Scan(&alreadyLinked)
+	if alreadyLinked {
+		c.JSON(409, gin.H{"success": false, "error": "ALREADY_LINKED", "message": "Tài liệu đã có trong phòng này"})
+		return
+	}
+
+	// 4. Insert link
+	_, err = config.DB.Exec(config.Ctx, `
+		INSERT INTO group_room_doc_links (room_id, document_id, linked_by)
+		VALUES ($1, $2, $3)`, roomID, req.DocumentID, userID)
+	if err != nil {
+		log.Printf("❌ [LinkDocToRoom] Insert error: %v", err)
+		c.JSON(500, gin.H{"success": false, "message": "Lỗi khi thêm tài liệu vào phòng"})
+		return
+	}
+
+	// 5. Broadcast WS event
+	var userName string
+	config.DB.QueryRow(config.Ctx, `SELECT name FROM users WHERE id = $1`, userID).Scan(&userName)
+	ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{
+		Type:   "doc_linked",
+		RoomID: roomID,
+		UserID: userID,
+		Payload: gin.H{
+			"user_name": userName,
+			"doc_name":  docTitle,
+			"doc_id":    req.DocumentID,
+		},
+	})
+
+	c.JSON(200, gin.H{"success": true, "data": gin.H{
+		"doc_id": req.DocumentID,
+		"title":  docTitle,
+	}})
 }
 
 // ============================================================
@@ -454,7 +540,12 @@ func getRoomDetail(roomID string) *models.GroupRoom {
 	room.InviteLink = fmt.Sprintf("https://mindex.io.vn/rooms/join?code=%s", room.InviteCode)
 
 	rows, _ := config.DB.Query(config.Ctx, `
-		SELECT grm.user_id, u.name, grm.joined_at, grm.doc_count, grm.is_host
+		SELECT grm.user_id, u.name, grm.joined_at, grm.is_host,
+		    (SELECT COUNT(*) FROM (
+		        SELECT d.id FROM documents d WHERE d.room_id = $1 AND d.user_id = grm.user_id
+		        UNION
+		        SELECT l.document_id FROM group_room_doc_links l WHERE l.room_id = $1 AND l.linked_by = grm.user_id
+		    ) doc_sub) AS actual_doc_count
 		FROM group_room_members grm
 		JOIN users u ON grm.user_id = u.id
 		WHERE grm.room_id = $1 AND grm.left_at IS NULL
@@ -463,7 +554,7 @@ func getRoomDetail(roomID string) *models.GroupRoom {
 		defer rows.Close()
 		for rows.Next() {
 			var m models.GroupRoomMember
-			rows.Scan(&m.UserID, &m.Name, &m.JoinedAt, &m.DocCount, &m.IsHost)
+			rows.Scan(&m.UserID, &m.Name, &m.JoinedAt, &m.IsHost, &m.DocCount)
 			m.RoomID = roomID
 
 			// Lấy LastSeen từ Redis
