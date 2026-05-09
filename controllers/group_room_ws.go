@@ -117,7 +117,14 @@ func handleRoomIncomingMessage(client *ws.RoomClient, roomID, userID string, raw
 			Payload: msg,
 		})
 
-		// Lưu vào Redis history (LPUSH + LTRIM giữ 50 tin)
+		// Lưu vào PostgreSQL (bền vững)
+		config.DB.Exec(config.Ctx, `
+			INSERT INTO room_messages (id, room_id, user_id, user_name, text, reply_to_id, mentions_ai, timestamp)
+			VALUES ($1, $2, $3, $4, $5, NULLIF($6,''), $7, $8)
+			ON CONFLICT (id) DO NOTHING`,
+			msg.ID, roomID, userID, userName, msg.Text, msg.ReplyToID, msg.MentionsAI, msg.Timestamp)
+
+		// Lưu vào Redis cache (LPUSH + LTRIM giữ 50 tin cho performance)
 		if config.RedisClient != nil {
 			msgJSON, _ := json.Marshal(msg)
 			key := fmt.Sprintf("room_chat_history:%s", roomID)
@@ -201,25 +208,66 @@ func handleMessageReaction(roomID, userID, msgID, emoji string) {
 	}
 }
 
-// sendRoomHistory gửi 20 tin nhắn gần nhất khi user vào phòng
+// sendRoomHistory gửi 50 tin nhắn gần nhất khi user vào phòng
+// Ưu tiên Redis cache, fallback về PostgreSQL nếu cache trống
 func sendRoomHistory(client *ws.RoomClient, roomID string) {
-	if config.RedisClient == nil {
-		return
-	}
-	key := fmt.Sprintf("room_chat_history:%s", roomID)
-	msgs, err := config.RedisClient.LRange(config.Ctx, key, 0, 19).Result()
-	if err != nil || len(msgs) == 0 {
-		return
-	}
-
-	// Đảo ngược để gửi theo thứ tự cũ → mới
-	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
-		msgs[i], msgs[j] = msgs[j], msgs[i]
-	}
-
 	var history []json.RawMessage
-	for _, m := range msgs {
-		history = append(history, json.RawMessage(m))
+
+	// 1. Thử Redis cache trước
+	if config.RedisClient != nil {
+		key := fmt.Sprintf("room_chat_history:%s", roomID)
+		msgs, err := config.RedisClient.LRange(config.Ctx, key, 0, 49).Result()
+		if err == nil && len(msgs) > 0 {
+			// Đảo ngược cũ → mới
+			for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+				msgs[i], msgs[j] = msgs[j], msgs[i]
+			}
+			for _, m := range msgs {
+				history = append(history, json.RawMessage(m))
+			}
+		}
+	}
+
+	// 2. Fallback: load từ PostgreSQL nếu Redis trống
+	if len(history) == 0 {
+		rows, err := config.DB.Query(config.Ctx, `
+			SELECT id, room_id, user_id, user_name, text,
+			       COALESCE(reply_to_id, ''), mentions_ai, timestamp
+			FROM room_messages
+			WHERE room_id = $1
+			ORDER BY timestamp DESC LIMIT 50`, roomID)
+		if err == nil {
+			defer rows.Close()
+			var dbMsgs []models.RoomChatMessage
+			for rows.Next() {
+				var m models.RoomChatMessage
+				rows.Scan(&m.ID, &m.RoomID, &m.UserID, &m.UserName, &m.Text,
+					&m.ReplyToID, &m.MentionsAI, &m.Timestamp)
+				dbMsgs = append(dbMsgs, m)
+			}
+			// Đảo ngược: DB trả DESC, cần ASC
+			for i, j := 0, len(dbMsgs)-1; i < j; i, j = i+1, j-1 {
+				dbMsgs[i], dbMsgs[j] = dbMsgs[j], dbMsgs[i]
+			}
+			for _, m := range dbMsgs {
+				b, _ := json.Marshal(m)
+				history = append(history, json.RawMessage(b))
+			}
+
+			// Warm up Redis cache
+			if config.RedisClient != nil && len(dbMsgs) > 0 {
+				key := fmt.Sprintf("room_chat_history:%s", roomID)
+				for i := len(dbMsgs) - 1; i >= 0; i-- {
+					b, _ := json.Marshal(dbMsgs[i])
+					config.RedisClient.LPush(config.Ctx, key, b)
+				}
+				config.RedisClient.LTrim(config.Ctx, key, 0, 49)
+			}
+		}
+	}
+
+	if len(history) == 0 {
+		return
 	}
 
 	payload, _ := json.Marshal(models.RoomEvent{

@@ -7,6 +7,7 @@ import (
 	"mindex-backend/config"
 	"mindex-backend/controllers"
 	"mindex-backend/utils"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -201,7 +202,49 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 	return nil
 }
 
-func deleteFromCloudinary(url string) error {
+func deleteFromCloudinary(rawURL string) error {
+	cloudName := os.Getenv("CLOUDINARY_CLOUD_NAME")
+	apiKey := os.Getenv("CLOUDINARY_API_KEY")
+	apiSecret := os.Getenv("CLOUDINARY_API_SECRET")
+
+	if cloudName == "" || apiKey == "" || apiSecret == "" || rawURL == "" {
+		return nil // không cấu hình → bỏ qua
+	}
+
+	// Trích xuất public_id từ URL dạng:
+	// https://res.cloudinary.com/{cloud}/raw/upload/v{ver}/mindex_uploads/file.pdf
+	parts := strings.SplitN(rawURL, "/upload/", 2)
+	if len(parts) < 2 {
+		return fmt.Errorf("cloudinary url invalid: %s", rawURL)
+	}
+	publicID := parts[1]
+	// Bỏ version prefix "v1234567890/"
+	if len(publicID) > 1 && publicID[0] == 'v' {
+		if idx := strings.Index(publicID, "/"); idx != -1 {
+			publicID = publicID[idx+1:]
+		}
+	}
+
+	timestamp := time.Now().Unix()
+	sigString := fmt.Sprintf("public_id=%s&timestamp=%d%s", publicID, timestamp, apiSecret)
+	hash := sha256.Sum256([]byte(sigString))
+	signature := fmt.Sprintf("%x", hash)
+
+	destroyEndpoint := fmt.Sprintf("https://api.cloudinary.com/v1_1/%s/raw/destroy", cloudName)
+
+	formBody := fmt.Sprintf("public_id=%s&timestamp=%d&api_key=%s&signature=%s",
+		publicID, timestamp, apiKey, signature)
+
+	resp, err := http.Post(destroyEndpoint, "application/x-www-form-urlencoded",
+		strings.NewReader(formBody))
+	if err != nil {
+		return fmt.Errorf("cloudinary delete request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("cloudinary delete returned %d", resp.StatusCode)
+	}
 	return nil
 }
 

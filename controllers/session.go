@@ -8,6 +8,46 @@ import (
 	"github.com/google/uuid"
 )
 
+// RenameSession đổi tên session
+// PATCH /chat/sessions/:session_id
+func RenameSession(c *gin.Context) {
+	sessionID := c.Param("session_id")
+	userID := c.GetString("user_id")
+
+	var req struct {
+		Title string `json:"title" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"success": false, "message": "Thiếu title"})
+		return
+	}
+
+	res, err := config.DB.Exec(config.Ctx,
+		`UPDATE chat_histories SET title = $1 WHERE session_id = $2 AND user_id = $3`,
+		req.Title, sessionID, userID)
+	if err != nil || res.RowsAffected() == 0 {
+		c.JSON(404, gin.H{"success": false, "message": "Không tìm thấy session"})
+		return
+	}
+	c.JSON(200, gin.H{"success": true, "message": "Đã đổi tên session"})
+}
+
+// DeleteSession xóa session và toàn bộ lịch sử chat
+// DELETE /chat/sessions/:session_id
+func DeleteSession(c *gin.Context) {
+	sessionID := c.Param("session_id")
+	userID := c.GetString("user_id")
+
+	res, err := config.DB.Exec(config.Ctx,
+		`DELETE FROM chat_histories WHERE session_id = $1 AND user_id = $2`,
+		sessionID, userID)
+	if err != nil || res.RowsAffected() == 0 {
+		c.JSON(404, gin.H{"success": false, "message": "Không tìm thấy session"})
+		return
+	}
+	c.JSON(200, gin.H{"success": true, "message": "Đã xóa session"})
+}
+
 func CreateSession(c *gin.Context) {
 	var req struct {
 		DocumentID string `json:"document_id" binding:"required"`

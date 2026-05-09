@@ -212,6 +212,8 @@ func InitiateUpload(c *gin.Context) {
 		})
 	}
 
+	go CheckAndAwardBadges(userID) // kiểm tra badge sau khi upload
+
 	c.JSON(202, gin.H{
 		"success": true,
 		"data": gin.H{

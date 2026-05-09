@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"time"
+
 	"mindex-backend/controllers"
 	"mindex-backend/middleware"
 	"mindex-backend/workers"
@@ -24,12 +26,18 @@ func RegisterDocumentRoutes(rg *gin.RouterGroup) {
 	doc.PATCH("/documents/:id/persona", controllers.UpdateDocumentPersona)
 	doc.DELETE("/documents/:id", controllers.DeleteDocument)
 
-	// Tóm tắt & Trích xuất
-	doc.POST("/summary/quick", controllers.QuickSummary)
-	doc.POST("/summary/detailed", controllers.DetailedSummary)
+	// Tóm tắt & Trích xuất — tất cả đều gọi AI, giới hạn per-user
+	aiRL := middleware.RateLimit("ai_extract", 20, time.Minute)  // 20 req/phút cho extract đơn
+	heavyRL := middleware.RateLimit("ai_heavy", 10, time.Minute) // 10 req/phút cho heavy ops
+
+	doc.POST("/summary/quick", aiRL, controllers.QuickSummary)
+	doc.POST("/summary/detailed", heavyRL, controllers.DetailedSummary)    // Map-Reduce, đắt nhất
 	doc.GET("/summary/cache/:id", controllers.GetCachedSummary)
-	doc.POST("/extract/keywords", controllers.ExtractKeywords)
-	doc.POST("/extract/timeline", controllers.ExtractTimeline)
+	doc.POST("/extract/keywords", aiRL, controllers.ExtractKeywords)
+	doc.POST("/extract/timeline", aiRL, controllers.ExtractTimeline)
+	doc.POST("/extract/formulas", aiRL, controllers.ExtractFormulas)
+	doc.POST("/extract/compare", heavyRL, controllers.ExtractCompare)      // So sánh nhiều doc
+	doc.POST("/extract/mindmap", aiRL, controllers.ExtractMindMap)
 
 	// Community Library (cần login)
 	doc.PATCH("/community/documents/:id", controllers.AddCommunityLibrary)           // Share/Unshare

@@ -14,6 +14,7 @@ type AppConfig struct {
 	RedisURL         string
 	JWTSecret        string
 	JWTRefreshSecret string
+	CORSOrigins      []string
 	GeminiChatKeys   []string
 	GeminiEmbedKeys  []string
 	GroqKeys         []string
@@ -131,12 +132,32 @@ func LoadConfig() {
 		nineRouterChatKeys = nineRouterKeys
 	}
 
+	// CORS origins — đọc từ env, fallback về các domain mặc định
+	defaultOrigins := []string{
+		"http://localhost:3000",
+		"https://mindex.io.vn",
+		"https://mindex-frontend.haidepzai92006.workers.dev",
+	}
+	var corsOrigins []string
+	if raw := os.Getenv("CORS_ORIGINS"); raw != "" {
+		for _, o := range strings.Split(raw, ",") {
+			o = strings.TrimSpace(o)
+			if o != "" {
+				corsOrigins = append(corsOrigins, o)
+			}
+		}
+	}
+	if len(corsOrigins) == 0 {
+		corsOrigins = defaultOrigins
+	}
+
 	Env = AppConfig{
 		Port:             port,
 		DatabaseURL:      dbURL,
 		RedisURL:         redisURL,
 		JWTSecret:        os.Getenv("JWT_SECRET"),
 		JWTRefreshSecret: os.Getenv("JWT_REFRESH_SECRET"),
+		CORSOrigins:      corsOrigins,
 		GeminiChatKeys:   geminiChatKeys,
 		GeminiEmbedKeys:  geminiEmbedKeys,
 		GroqKeys:         groqKeys,

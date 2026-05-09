@@ -5,6 +5,7 @@ import (
 	"log"
 	"mindex-backend/config"
 	"mindex-backend/internal/persona"
+	"mindex-backend/internal/startup"
 	"mindex-backend/routes"
 	"mindex-backend/utils"
     "mindex-backend/utils/quota"
@@ -48,6 +49,9 @@ func main() {
 
 	config.ConnectRedis()
 	defer config.CloseRedis()
+
+	// Chạy DDL idempotent một lần khi khởi động (thay vì trong handlers)
+	startup.RunMigrations()
 
     // 3c. Init Quota Tracker
     quota.InitTracker()
@@ -96,9 +100,10 @@ func main() {
 
 	// 4. Khởi chạy Background Workers
 	workers.StartWorkerPool()
-	workers.StartSweeper() // Chạy ngầm dọn dẹp lúc 3AM
-	workers.StartExpirer() // Thông báo hết hạn realtime
-	workers.StartAlertChecker() // Giám sát chất lượng AI, alert nếu thumbs down > 30%
+	workers.StartSweeper()              // Chạy ngầm dọn dẹp lúc 3AM
+	workers.StartExpirer()              // Thông báo hết hạn realtime
+	workers.StartAlertChecker()         // Giám sát chất lượng AI
+	workers.StartSubscriptionExpirer()  // Downgrade tier hết hạn lúc 2AM
 
 	// 4b. Khởi chạy WebSocket Hub cho Feedback & Group Chat
 	go ws.GlobalHub.Run()
@@ -114,7 +119,7 @@ func main() {
 
 	// 6. Setup CORS chuyên sâu để cho phép Frontend (3000) gọi Backend (8080)
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "https://mindex.io.vn", "https://mindex-frontend.haidepzai92006.workers.dev"},
+		AllowOrigins:     config.Env.CORSOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -143,8 +148,11 @@ func main() {
 		routes.RegisterNotificationRoutes(api)
 		routes.RegisterFeedbackRoutes(api)
 		routes.RegisterBillingRoutes(api)
-		routes.RegisterStudyToolsRoutes(api) // P1: Flashcard + Quiz
-		routes.RegisterRoomRoutes(api)        // Group Study Chat
+		routes.RegisterStudyToolsRoutes(api)   // Flashcard + Quiz + Planner
+		routes.RegisterRoomRoutes(api)         // Group Study Chat
+		routes.RegisterAnalyticsRoutes(api)    // Learning Analytics
+		routes.RegisterGamificationRoutes(api) // Badges + Streaks
+		routes.RegisterProfileRoutes(api)      // Public Profiles
 	}
 
 	// 8. Start server

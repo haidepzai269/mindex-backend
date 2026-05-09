@@ -478,6 +478,90 @@ func LinkDocToRoom(c *gin.Context) {
 	}})
 }
 
+// UnlinkDocFromRoom — DELETE /api/v1/rooms/:id/docs/:doc_id
+// Host hoặc người đã link tài liệu mới được gỡ
+func UnlinkDocFromRoom(c *gin.Context) {
+	userID := c.GetString("user_id")
+	roomID := c.Param("id")
+	docID := c.Param("doc_id")
+
+	if !IsRoomMember(roomID, userID) {
+		c.JSON(403, gin.H{"success": false, "message": "Bạn không phải thành viên phòng này"})
+		return
+	}
+
+	// Kiểm tra host hoặc là người đã link tài liệu
+	var isHost bool
+	config.DB.QueryRow(config.Ctx, `SELECT is_host FROM group_room_members WHERE room_id=$1 AND user_id=$2 AND left_at IS NULL`, roomID, userID).Scan(&isHost)
+
+	var linkedBy string
+	config.DB.QueryRow(config.Ctx, `SELECT linked_by FROM group_room_doc_links WHERE room_id=$1 AND document_id=$2`, roomID, docID).Scan(&linkedBy)
+
+	// Cũng cho phép owner của document uploaded vào room (không qua link)
+	var docOwnerID string
+	config.DB.QueryRow(config.Ctx, `SELECT user_id FROM documents WHERE id=$1 AND room_id=$2`, docID, roomID).Scan(&docOwnerID)
+
+	if !isHost && linkedBy != userID && docOwnerID != userID {
+		c.JSON(403, gin.H{"success": false, "message": "Chỉ host hoặc người thêm tài liệu mới có thể gỡ"})
+		return
+	}
+
+	// Xóa link
+	res, err := config.DB.Exec(config.Ctx, `DELETE FROM group_room_doc_links WHERE room_id=$1 AND document_id=$2`, roomID, docID)
+	if err != nil || res.RowsAffected() == 0 {
+		// Thử xóa doc upload trực tiếp vào room
+		config.DB.Exec(config.Ctx, `UPDATE documents SET room_id=NULL WHERE id=$1 AND room_id=$2`, docID, roomID)
+	}
+
+	var userName string
+	config.DB.QueryRow(config.Ctx, `SELECT name FROM users WHERE id=$1`, userID).Scan(&userName)
+	ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{
+		Type: "doc_unlinked", RoomID: roomID, UserID: userID,
+		Payload: gin.H{"doc_id": docID, "user_name": userName},
+	})
+
+	c.JSON(200, gin.H{"success": true, "message": "Đã gỡ tài liệu khỏi phòng"})
+}
+
+// KickMember — POST /api/v1/rooms/:id/kick/:user_id
+// Chỉ host mới được kick thành viên (không tự kick)
+func KickMember(c *gin.Context) {
+	hostID := c.GetString("user_id")
+	roomID := c.Param("id")
+	targetID := c.Param("user_id")
+
+	if hostID == targetID {
+		c.JSON(400, gin.H{"success": false, "message": "Không thể tự kick chính mình"})
+		return
+	}
+
+	var isHost bool
+	config.DB.QueryRow(config.Ctx, `SELECT is_host FROM group_room_members WHERE room_id=$1 AND user_id=$2 AND left_at IS NULL`, roomID, hostID).Scan(&isHost)
+	if !isHost {
+		c.JSON(403, gin.H{"success": false, "message": "Chỉ chủ phòng mới có quyền kick thành viên"})
+		return
+	}
+
+	res, err := config.DB.Exec(config.Ctx, `
+		UPDATE group_room_members SET left_at = NOW()
+		WHERE room_id=$1 AND user_id=$2 AND left_at IS NULL`, roomID, targetID)
+	if err != nil || res.RowsAffected() == 0 {
+		c.JSON(404, gin.H{"success": false, "message": "Không tìm thấy thành viên"})
+		return
+	}
+
+	var targetName string
+	config.DB.QueryRow(config.Ctx, `SELECT name FROM users WHERE id=$1`, targetID).Scan(&targetName)
+
+	ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{
+		Type: "user_kicked", RoomID: roomID, UserID: targetID,
+		Payload: gin.H{"user_id": targetID, "name": targetName},
+	})
+
+	log.Printf("[Room %s] Host %s kicked member %s", roomID, hostID, targetID)
+	c.JSON(200, gin.H{"success": true, "message": fmt.Sprintf("Đã kick %s khỏi phòng", targetName)})
+}
+
 // ============================================================
 // Helpers
 // ============================================================

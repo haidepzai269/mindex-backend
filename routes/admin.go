@@ -35,6 +35,10 @@ func RegisterAdminRoutes(r *gin.RouterGroup) {
 		admin.GET("/quality/stats", controllers.AdminQualityStats)
 		admin.GET("/quality/timeline", controllers.AdminQualityTimeline)
 		admin.GET("/quality/low-rated", controllers.AdminLowRatedQuestions)
+
+		// User Management
+		admin.GET("/users", controllers.AdminListUsers)
+		admin.PATCH("/users/:id/tier", controllers.AdminUpdateUserTier)
 	}
 }
 

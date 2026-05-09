@@ -1,11 +1,17 @@
 package controllers
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"math/rand"
-	"os"
-	"strconv"
 	"log"
+	"math/big"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -69,9 +75,9 @@ func CreatePaymentLink(c *gin.Context) {
 		return
 	}
 
-	rand.Seed(time.Now().UnixNano())
-	// Ensure positive int64 for OrderCode less than 9007199254740991 (js max safe integer)
-	orderCode := time.Now().Unix()*10 + int64(rand.Intn(10))
+	// Tạo orderCode an toàn, tránh rand.Seed deprecated
+	n, _ := rand.Int(rand.Reader, big.NewInt(10))
+	orderCode := time.Now().Unix()*10 + n.Int64()
 
 	_, err := config.DB.Exec(config.Ctx, 
 		"INSERT INTO payments (user_id, order_code, amount, package_name, status) VALUES ($1, $2, $3, $4, 'PENDING')",
@@ -143,9 +149,10 @@ func VerifyPaymentClient(c *gin.Context) {
 	}
 
 	if info.Status == "PAID" {
+		expiresAt := time.Now().AddDate(0, 1, 0) // 1 tháng
 		config.DB.Exec(config.Ctx, "UPDATE payments SET status = 'PAID', updated_at = NOW() WHERE order_code = $1", orderCode)
-		config.DB.Exec(config.Ctx, "UPDATE users SET tier = $1 WHERE id = $2", pkg, userID)
-		
+		config.DB.Exec(config.Ctx, "UPDATE users SET tier = $1, tier_expires_at = $2 WHERE id = $3", pkg, expiresAt, userID)
+
 		if config.RedisClient != nil {
 			config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID))
 		}
@@ -154,6 +161,119 @@ func VerifyPaymentClient(c *gin.Context) {
 	}
 
 	c.JSON(400, gin.H{"success": false, "message": "Giao dịch chưa hoàn tất", "status": info.Status})
+}
+
+// verifyPayOSSignature xác thực chữ ký HMAC-SHA256 từ PayOS webhook
+func verifyPayOSSignature(data map[string]interface{}, signature string) bool {
+	checksumKey := os.Getenv("PAYOS_CHECKSUM_KEY")
+	if checksumKey == "" {
+		return false
+	}
+	// Sắp xếp keys theo thứ tự alphabet, nối thành "key=value&key=value"
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, data[k]))
+	}
+	payload := strings.Join(parts, "&")
+
+	mac := hmac.New(sha256.New, []byte(checksumKey))
+	mac.Write([]byte(payload))
+	expected := hex.EncodeToString(mac.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(signature))
+}
+
+// PayOSWebhook nhận callback từ PayOS sau khi thanh toán thành công
+// POST /api/v1/billings/webhook (no auth — public, verified by checksum)
+func PayOSWebhook(c *gin.Context) {
+	var body struct {
+		Code      string                 `json:"code"`
+		Data      map[string]interface{} `json:"data"`
+		Signature string                 `json:"signature"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(400, gin.H{"error": "invalid body"})
+		return
+	}
+
+	// Verify HMAC-SHA256 signature
+	if !verifyPayOSSignature(body.Data, body.Signature) {
+		log.Printf("[PayOS Webhook] Invalid signature")
+		c.JSON(400, gin.H{"error": "invalid signature"})
+		return
+	}
+
+	// Chỉ xử lý thanh toán thành công
+	if body.Code != "00" {
+		c.JSON(200, gin.H{"message": "ok"})
+		return
+	}
+
+	orderCodeFloat, _ := body.Data["orderCode"].(float64)
+	orderCode := int64(orderCodeFloat)
+	if orderCode == 0 {
+		c.JSON(200, gin.H{"message": "ok"})
+		return
+	}
+
+	var userID, pkg, status string
+	err := config.DB.QueryRow(config.Ctx,
+		"SELECT user_id, package_name, status FROM payments WHERE order_code = $1",
+		orderCode).Scan(&userID, &pkg, &status)
+	if err != nil || status == "PAID" {
+		c.JSON(200, gin.H{"message": "ok"})
+		return
+	}
+
+	expiresAt := time.Now().AddDate(0, 1, 0) // 1 tháng
+	config.DB.Exec(config.Ctx, "UPDATE payments SET status = 'PAID', updated_at = NOW() WHERE order_code = $1", orderCode)
+	config.DB.Exec(config.Ctx, "UPDATE users SET tier = $1, tier_expires_at = $2 WHERE id = $3", pkg, expiresAt, userID)
+
+	if config.RedisClient != nil {
+		config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID))
+	}
+
+	log.Printf("[PayOS Webhook] ✅ User %s upgraded to %s (expires %s) via orderCode %d", userID, pkg, expiresAt.Format("2006-01-02"), orderCode)
+	c.JSON(200, gin.H{"message": "ok"})
+}
+
+// GetPaymentHistory — GET /api/v1/billings/history
+// Lịch sử giao dịch của user hiện tại
+func GetPaymentHistory(c *gin.Context) {
+	userID := c.GetString("user_id")
+
+	rows, err := config.DB.Query(config.Ctx, `
+		SELECT order_code, amount, package_name, status, created_at
+		FROM payments WHERE user_id = $1
+		ORDER BY created_at DESC LIMIT 20`, userID)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "message": "Lỗi truy vấn"})
+		return
+	}
+	defer rows.Close()
+
+	type Payment struct {
+		OrderCode   int64     `json:"order_code"`
+		Amount      int       `json:"amount"`
+		PackageName string    `json:"package_name"`
+		Status      string    `json:"status"`
+		CreatedAt   time.Time `json:"created_at"`
+	}
+	var history []Payment
+	for rows.Next() {
+		var p Payment
+		rows.Scan(&p.OrderCode, &p.Amount, &p.PackageName, &p.Status, &p.CreatedAt)
+		history = append(history, p)
+	}
+	if history == nil {
+		history = []Payment{}
+	}
+	c.JSON(200, gin.H{"success": true, "data": history})
 }
 
 // ---------------- ADMIN ----------------

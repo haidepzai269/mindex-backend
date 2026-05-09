@@ -29,53 +29,56 @@ const (
 	UltraFlashcardDailyQuota = 8
 )
 
-// checkStudyQuota kiểm tra và tăng quota học tập của user
+// checkStudyQuota kiểm tra và tăng quota học tập của user — ATOMIC (không race condition)
 // Trả về (allowed, currentCount, error)
 func checkStudyQuota(userID, quotaType string, maxLimit int) (bool, int, error) {
 	ctx := context.Background()
 
-	// Reset quota nếu sang ngày mới
-	_, err := config.DB.Exec(ctx, `
+	// Đảm bảo row tồn tại (idempotent)
+	config.DB.Exec(ctx, `
 		INSERT INTO study_quota (user_id, quiz_gens_today, flashcard_gens_today, last_reset_date)
 		VALUES ($1, 0, 0, CURRENT_DATE)
-		ON CONFLICT (user_id) DO UPDATE
-		SET quiz_gens_today = CASE
-			WHEN study_quota.last_reset_date < CURRENT_DATE THEN 0
-			ELSE study_quota.quiz_gens_today
-		END,
-		flashcard_gens_today = CASE
-			WHEN study_quota.last_reset_date < CURRENT_DATE THEN 0
-			ELSE study_quota.flashcard_gens_today
-		END,
-		last_reset_date = CURRENT_DATE`, userID)
-	if err != nil {
-		return false, 0, err
-	}
-
-	// Đọc count hiện tại
-	var quizCount, flashCount int
-	config.DB.QueryRow(ctx,
-		`SELECT quiz_gens_today, flashcard_gens_today FROM study_quota WHERE user_id = $1`, userID).
-		Scan(&quizCount, &flashCount)
+		ON CONFLICT (user_id) DO NOTHING`, userID)
 
 	if quotaType == "quiz" {
-		if quizCount >= maxLimit {
-			return false, quizCount, nil
+		// Atomic: reset nếu sang ngày mới VÀ còn dưới giới hạn thì mới increment
+		var newCount int
+		err := config.DB.QueryRow(ctx, `
+			UPDATE study_quota
+			SET quiz_gens_today      = CASE WHEN last_reset_date < CURRENT_DATE THEN 1 ELSE quiz_gens_today + 1 END,
+			    flashcard_gens_today = CASE WHEN last_reset_date < CURRENT_DATE THEN 0 ELSE flashcard_gens_today END,
+			    last_reset_date      = CURRENT_DATE
+			WHERE user_id = $1
+			  AND (last_reset_date < CURRENT_DATE OR quiz_gens_today < $2)
+			RETURNING quiz_gens_today`, userID, maxLimit).Scan(&newCount)
+		if err != nil {
+			// Không có row nào bị update → quota exceeded
+			var cur int
+			config.DB.QueryRow(ctx, `SELECT COALESCE(quiz_gens_today, 0) FROM study_quota WHERE user_id = $1`, userID).Scan(&cur)
+			return false, cur, nil
 		}
-		config.DB.Exec(ctx, `UPDATE study_quota SET quiz_gens_today = quiz_gens_today + 1 WHERE user_id = $1`, userID)
-		return true, quizCount + 1, nil
+		return true, newCount, nil
 	}
 
 	if quotaType == "flashcard" {
-		if flashCount >= maxLimit {
-			return false, flashCount, nil
+		var newCount int
+		err := config.DB.QueryRow(ctx, `
+			UPDATE study_quota
+			SET flashcard_gens_today = CASE WHEN last_reset_date < CURRENT_DATE THEN 1 ELSE flashcard_gens_today + 1 END,
+			    quiz_gens_today      = CASE WHEN last_reset_date < CURRENT_DATE THEN 0 ELSE quiz_gens_today END,
+			    last_reset_date      = CURRENT_DATE
+			WHERE user_id = $1
+			  AND (last_reset_date < CURRENT_DATE OR flashcard_gens_today < $2)
+			RETURNING flashcard_gens_today`, userID, maxLimit).Scan(&newCount)
+		if err != nil {
+			var cur int
+			config.DB.QueryRow(ctx, `SELECT COALESCE(flashcard_gens_today, 0) FROM study_quota WHERE user_id = $1`, userID).Scan(&cur)
+			return false, cur, nil
 		}
-		config.DB.Exec(ctx, `UPDATE study_quota SET flashcard_gens_today = flashcard_gens_today + 1 WHERE user_id = $1`, userID)
-		return true, flashCount + 1, nil
+		return true, newCount, nil
 	}
 
-	// flashcard: không giới hạn lần tạo, chỉ giới hạn số card
-	return true, flashCount, nil
+	return true, 0, nil
 }
 
 // ─── Flashcard APIs ───────────────────────────────────────────────────────────
@@ -394,12 +397,57 @@ func GetFlashcards(c *gin.Context) {
 
 // MarkFlashcard đánh dấu card đã nhớ/chưa nhớ
 // PATCH /api/study/flashcards/:card_id/mark
+// sm2Update tính toán SM-2 algorithm và trả về (newInterval, newEase, nextReviewAt)
+// quality: 5=perfect, 4=correct, 3=correct with hesitation, 2=incorrect, 1=forgot
+func sm2Update(interval int, ease float64, repetitions int, quality int) (int, float64, time.Time) {
+	if interval == 0 {
+		interval = 1
+	}
+	if ease == 0 {
+		ease = 2.5
+	}
+
+	var newInterval int
+	var newRepetitions int
+
+	if quality >= 3 {
+		switch repetitions {
+		case 0:
+			newInterval = 1
+		case 1:
+			newInterval = 6
+		default:
+			newInterval = int(float64(interval) * ease)
+			if newInterval < 1 {
+				newInterval = 1
+			}
+		}
+		newRepetitions = repetitions + 1
+	} else {
+		newInterval = 1
+		newRepetitions = 0
+	}
+
+	// Điều chỉnh ease_factor
+	newEase := ease + (0.1 - float64(5-quality)*(0.08+float64(5-quality)*0.02))
+	if newEase < 1.3 {
+		newEase = 1.3
+	}
+
+	nextReview := time.Now().AddDate(0, 0, newInterval)
+	_ = newRepetitions
+	return newInterval, newEase, nextReview
+}
+
+// MarkFlashcard cập nhật trạng thái nhớ + SM-2 scheduling
+// PATCH /study/flashcards/:card_id/mark
 func MarkFlashcard(c *gin.Context) {
 	userID := c.GetString("user_id")
 	cardID := c.Param("card_id")
 
 	var req struct {
 		Remembered bool `json:"remembered"`
+		Quality    *int `json:"quality"` // SM-2 quality 1-5 (optional, default từ remembered)
 	}
 	c.ShouldBindJSON(&req)
 
@@ -413,25 +461,104 @@ func MarkFlashcard(c *gin.Context) {
 		return
 	}
 
-	// 1. Lấy set_id để xóa cache
-	var setID string
-	config.DB.QueryRow(config.Ctx, `SELECT set_id FROM flashcards WHERE id = $1`, cardID).Scan(&setID)
+	// Map remembered → quality nếu không truyền quality cụ thể
+	quality := 5
+	if req.Quality != nil {
+		quality = *req.Quality
+	} else if !req.Remembered {
+		quality = 1
+	}
 
-	// 2. Cập nhật vào DB
-	_, err := config.DB.Exec(config.Ctx,
-		`UPDATE flashcards SET remembered = $1 WHERE id = $2`, req.Remembered, cardID)
+	// Lấy trạng thái SM-2 hiện tại
+	var interval int
+	var ease float64
+	var reps int
+	var setID string
+	config.DB.QueryRow(config.Ctx,
+		`SELECT set_id, COALESCE(interval_days,1), COALESCE(ease_factor,2.5), COALESCE(repetitions,0)
+		 FROM flashcards WHERE id = $1`, cardID).Scan(&setID, &interval, &ease, &reps)
+
+	newInterval, newEase, nextReview := sm2Update(interval, ease, reps, quality)
+
+	remembered := quality >= 3
+	_, err := config.DB.Exec(config.Ctx, `
+		UPDATE flashcards
+		SET remembered = $1,
+		    interval_days = $2,
+		    ease_factor = $3,
+		    repetitions = repetitions + CASE WHEN $4 >= 3 THEN 1 ELSE 0 END,
+		    next_review_at = $5
+		WHERE id = $6`,
+		remembered, newInterval, newEase, quality, nextReview, cardID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể cập nhật"})
 		return
 	}
 
-	// 3. XÓA CACHE REDIS để lần load sau lấy dữ liệu mới
 	if config.RedisClient != nil && setID != "" {
 		config.RedisClient.Del(config.Ctx, "flashcards_set:"+setID)
-		log.Printf("🧹 [Flashcard] Invalidated cache for set %s due to mark", setID)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"success": true})
+	go CheckAndAwardBadges(userID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":        true,
+		"next_review_at": nextReview,
+		"interval_days":  newInterval,
+	})
+}
+
+// GetDueFlashcards trả về các thẻ đến hạn ôn tập hôm nay (SM-2)
+// GET /study/flashcards/:set_id/due
+func GetDueFlashcards(c *gin.Context) {
+	userID := c.GetString("user_id")
+	setID := c.Param("set_id")
+
+	var ownerID string
+	config.DB.QueryRow(config.Ctx, `SELECT user_id FROM flashcard_sets WHERE id = $1`, setID).Scan(&ownerID)
+	if ownerID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
+		return
+	}
+
+	rows, err := config.DB.Query(config.Ctx, `
+		SELECT id, front, back, difficulty, COALESCE(topic,''),
+		       COALESCE(remembered, false),
+		       COALESCE(interval_days, 1),
+		       COALESCE(ease_factor, 2.5),
+		       COALESCE(next_review_at, NOW())
+		FROM flashcards
+		WHERE set_id = $1
+		  AND (next_review_at IS NULL OR next_review_at <= NOW() + INTERVAL '1 day')
+		ORDER BY COALESCE(next_review_at, NOW()) ASC`, setID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Query error"})
+		return
+	}
+	defer rows.Close()
+
+	type Card struct {
+		ID           string    `json:"id"`
+		Front        string    `json:"front"`
+		Back         string    `json:"back"`
+		Difficulty   string    `json:"difficulty"`
+		Topic        string    `json:"topic"`
+		Remembered   bool      `json:"remembered"`
+		IntervalDays int       `json:"interval_days"`
+		EaseFactor   float64   `json:"ease_factor"`
+		NextReviewAt time.Time `json:"next_review_at"`
+	}
+	var cards []Card
+	for rows.Next() {
+		var card Card
+		rows.Scan(&card.ID, &card.Front, &card.Back, &card.Difficulty, &card.Topic,
+			&card.Remembered, &card.IntervalDays, &card.EaseFactor, &card.NextReviewAt)
+		cards = append(cards, card)
+	}
+	if cards == nil {
+		cards = []Card{}
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": cards, "due_count": len(cards)})
 }
 
 // ─── Quiz APIs ────────────────────────────────────────────────────────────────
@@ -755,6 +882,8 @@ func SubmitQuiz(c *gin.Context) {
 		return
 	}
 
+	go CheckAndAwardBadges(userID) // kiểm tra badge mới sau khi nộp quiz
+
 	c.JSON(http.StatusOK, gin.H{
 		"success":    true,
 		"attempt_id": attemptID,
@@ -850,10 +979,90 @@ func ExportFlashcardsCSV(c *gin.Context) {
 	c.String(http.StatusOK, sb.String())
 }
 
-// Utility
-func min(a, b int) int {
-	if a < b {
-		return a
+// GetQuizHistory trả về danh sách quiz + lịch sử attempts của user cho một doc
+// GET /study/docs/:doc_id/quiz/history
+func GetQuizHistory(c *gin.Context) {
+	userID := c.GetString("user_id")
+	docID := c.Param("doc_id")
+
+	rows, err := config.DB.Query(config.Ctx, `
+		SELECT q.id, q.title, q.question_count, q.created_at,
+		       COALESCE(a.attempt_count, 0) as attempt_count,
+		       a.best_score, a.last_score, a.last_attempt_at
+		FROM quizzes q
+		LEFT JOIN (
+			SELECT quiz_id,
+			       COUNT(*) as attempt_count,
+			       MAX(score) as best_score,
+			       (array_agg(score ORDER BY created_at DESC))[1] as last_score,
+			       MAX(created_at) as last_attempt_at
+			FROM quiz_attempts WHERE user_id = $1
+			GROUP BY quiz_id
+		) a ON a.quiz_id = q.id
+		WHERE q.doc_id = $2
+		ORDER BY q.created_at DESC`, userID, docID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Query error"})
+		return
 	}
-	return b
+	defer rows.Close()
+
+	type QuizSummary struct {
+		ID            string     `json:"id"`
+		Title         string     `json:"title"`
+		QuestionCount int        `json:"question_count"`
+		CreatedAt     time.Time  `json:"created_at"`
+		AttemptCount  int        `json:"attempt_count"`
+		BestScore     *float64   `json:"best_score"`
+		LastScore     *float64   `json:"last_score"`
+		LastAttemptAt *time.Time `json:"last_attempt_at"`
+	}
+
+	var quizzes []QuizSummary
+	for rows.Next() {
+		var q QuizSummary
+		rows.Scan(&q.ID, &q.Title, &q.QuestionCount, &q.CreatedAt,
+			&q.AttemptCount, &q.BestScore, &q.LastScore, &q.LastAttemptAt)
+		quizzes = append(quizzes, q)
+	}
+	if quizzes == nil {
+		quizzes = []QuizSummary{}
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": quizzes})
+}
+
+// GetQuizAttempt trả về chi tiết một lần làm quiz
+// GET /study/attempts/:attempt_id
+func GetQuizAttempt(c *gin.Context) {
+	userID := c.GetString("user_id")
+	attemptID := c.Param("attempt_id")
+
+	var quizID, answersRaw string
+	var score float64
+	var timeSpent int
+	var createdAt time.Time
+
+	err := config.DB.QueryRow(config.Ctx, `
+		SELECT quiz_id, answers, score, time_spent_sec, created_at
+		FROM quiz_attempts WHERE id = $1 AND user_id = $2`,
+		attemptID, userID).Scan(&quizID, &answersRaw, &score, &timeSpent, &createdAt)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Attempt not found"})
+		return
+	}
+
+	var answers []map[string]interface{}
+	json.Unmarshal([]byte(answersRaw), &answers)
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"attempt_id":     attemptID,
+			"quiz_id":        quizID,
+			"score":          score,
+			"time_spent_sec": timeSpent,
+			"created_at":     createdAt,
+			"answers":        answers,
+		},
+	})
 }

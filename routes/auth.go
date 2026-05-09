@@ -1,6 +1,8 @@
 package routes
 
 import (
+	"time"
+
 	"mindex-backend/controllers"
 	"mindex-backend/middleware"
 
@@ -10,12 +12,12 @@ import (
 func RegisterAuthRoutes(rg *gin.RouterGroup) {
 	auth := rg.Group("/auth")
 
-	// Public routes
+	// Public routes (login bị giới hạn 10 lần/phút per IP để chống brute-force)
 	auth.POST("/register", controllers.Register)
-	auth.POST("/login", controllers.Login)
+	auth.POST("/login", middleware.RateLimit("login", 10, 60*time.Second), controllers.Login)
 	auth.POST("/google", controllers.GoogleLogin)
 	auth.POST("/refresh", controllers.Refresh)
-	auth.POST("/forgot-password/send-otp", controllers.ForgotPasswordSendOTP)
+	auth.POST("/forgot-password/send-otp", middleware.RateLimit("otp", 5, 60*time.Second), controllers.ForgotPasswordSendOTP)
 	auth.POST("/forgot-password/reset", controllers.ResetPassword)
 	auth.GET("/onboarding-personas", controllers.GetOnboardingPersonas)
 	auth.GET("/check-email", controllers.CheckEmail)

@@ -97,6 +97,7 @@ func AddCommunityLibrary(c *gin.Context) {
 			utils.ClearCommunityCache()
 		}
 
+		go CheckAndAwardBadges(userID) // kiểm tra badge community_contributor
 		c.JSON(200, gin.H{"success": true, "message": "Đã chia sẻ vào Thư viện chung. Tài liệu sẽ tồn tại 30 ngày và được gia hạn khi có tương tác."})
 	} else {
 		// ── RÚT: is_public=FALSE, xóa contributor_id, cập nhật expired_at ──
@@ -159,13 +160,23 @@ func AddCommunityLibrary(c *gin.Context) {
 func SearchCommunity(c *gin.Context) {
 	query := strings.TrimSpace(c.Query("q"))
 	subject := c.Query("subject")
+	sort := c.DefaultQuery("sort", "newest") // newest | upvotes | usage
 	personaFilter := c.DefaultQuery("persona_filter", "true") == "true"
 	userPersona := c.GetString("persona")
 	_ = personaFilter
 	_ = userPersona
 
+	// Xây dựng ORDER BY clause dựa trên sort param
+	sortClause := "display_date DESC"
+	switch sort {
+	case "upvotes":
+		sortClause = "upvote_count DESC, display_date DESC"
+	case "usage":
+		sortClause = "query_count DESC, display_date DESC"
+	}
+
 	// ── LEVEL 2 CACHE (BẬT LẠI SAU KHI DEBUG) ──
-	resultCacheKey := utils.GenerateCacheKey("results", query, subject)
+	resultCacheKey := utils.GenerateCacheKey("results", query+"|sort:"+sort, subject)
 	if cachedData := utils.GetCache(resultCacheKey); cachedData != "" {
 		var resp gin.H
 		if err := json.Unmarshal([]byte(cachedData), &resp); err == nil {
@@ -291,7 +302,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 				hybrid_score, display_date
 			FROM scoring s
 			WHERE hybrid_score > 0
-			ORDER BY hybrid_score DESC, display_date DESC
+			ORDER BY hybrid_score DESC, ` + sortClause + `
 			LIMIT 32`
 
 	} else if query != "" {
@@ -317,7 +328,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 			args = append(args, subject)
 		}
 		
-		sqlQuery += " ORDER BY display_date DESC LIMIT 32"
+		sqlQuery += " ORDER BY " + sortClause + " LIMIT 32"
 
 	} else {
 		// 3. CHẾ ĐỘ DUYỆT (BROWSE MODE - KHI MỚI VÀO TRANG)
@@ -339,7 +350,7 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 			args = append(args, subject)
 		}
 		
-		sqlQuery += " ORDER BY display_date DESC LIMIT 32"
+		sqlQuery += " ORDER BY " + sortClause + " LIMIT 32"
 	}
 
 	rows, err := config.DB.Query(config.Ctx, sqlQuery, args...)
@@ -517,6 +528,11 @@ func UseCommunityDocument(c *gin.Context) {
 
 	// Tăng query_count và gia hạn expired_at (Survival of the Fittest)
 	go RefreshPublicDocExpiry(docID)
+
+	// Xóa cache danh sách tài liệu của user để thư viện cá nhân được cập nhật
+	if config.RedisClient != nil {
+		utils.ClearUserCache("docs", userID)
+	}
 
 	log.Printf("✅ [Community] User %s đã thêm tài liệu công khai %s vào thư viện", userID, docID)
 	c.JSON(201, gin.H{
