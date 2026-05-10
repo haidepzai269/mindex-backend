@@ -65,10 +65,10 @@ func GetAnalyticsActivity(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	rows, err := config.DB.Query(config.Ctx, `
-		SELECT DATE(created_at) as day, COUNT(*) as quiz_count, COALESCE(AVG(score),0) as avg_score
+		SELECT DATE(completed_at) as day, COUNT(*) as quiz_count, COALESCE(AVG(score),0) as avg_score
 		FROM quiz_attempts
-		WHERE user_id = $1 AND created_at >= NOW() - INTERVAL '30 days'
-		GROUP BY DATE(created_at)
+		WHERE user_id = $1 AND completed_at >= NOW() - INTERVAL '30 days'
+		GROUP BY DATE(completed_at)
 		ORDER BY day ASC`, userID)
 	if err != nil {
 		log.Printf("[Analytics] activity query error for user %s: %v", userID, err)

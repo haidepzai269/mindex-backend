@@ -1066,3 +1066,140 @@ func GetQuizAttempt(c *gin.Context) {
 		},
 	})
 }
+
+// ─── Mindmap APIs ─────────────────────────────────────────────────────────────
+
+// GenerateMindmap tạo mindmap JSON từ tài liệu bằng AI và cache vào Redis
+// POST /api/study/docs/:doc_id/mindmap/generate
+func GenerateMindmap(c *gin.Context) {
+	userID := c.GetString("user_id")
+	docID := c.Param("doc_id")
+
+	// 1. Kiểm tra cache Redis
+	cacheKey := "mindmap:" + docID
+	if config.RedisClient != nil {
+		cached, err := config.RedisClient.Get(config.Ctx, cacheKey).Result()
+		if err == nil {
+			log.Printf("🚀 [Mindmap] Cache hit for doc %s", docID)
+			c.Data(http.StatusOK, "application/json", []byte(cached))
+			return
+		}
+	}
+
+	// 2. Kiểm tra quyền (phải là chủ tài liệu hoặc có quyền xem - tạm check xem doc có tồn tại không)
+	var docTitle string
+	err := config.DB.QueryRow(config.Ctx, `SELECT title FROM documents WHERE id = $1`, docID).Scan(&docTitle)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Tài liệu không tồn tại"})
+		return
+	}
+
+	// 3. Lấy top 40 chunks
+	rows, err := config.DB.Query(config.Ctx, `
+		SELECT id, content, page_number FROM document_chunks
+		WHERE document_id = $1
+		ORDER BY chunk_index ASC LIMIT 40`, docID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không thể lấy nội dung tài liệu"})
+		return
+	}
+	defer rows.Close()
+
+	var chunksText strings.Builder
+	for rows.Next() {
+		var chunkID, content string
+		var pageNum *int
+		rows.Scan(&chunkID, &content, &pageNum)
+		p := 0
+		if pageNum != nil {
+			p = *pageNum
+		}
+		chunksText.WriteString(fmt.Sprintf("[ChunkID: %s | Page: %d]\n%s\n\n", chunkID, p, content))
+	}
+
+	combinedText := chunksText.String()
+	if len(combinedText) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Tài liệu không có nội dung"})
+		return
+	}
+
+	// 4. Build AI prompt
+	promptSys := `Bạn là chuyên gia tổng hợp kiến thức. Hãy đọc nội dung tài liệu (các đoạn text được gắn ChunkID và Page) và tạo ra một Mindmap biểu diễn các ý chính và mối quan hệ giữa chúng.
+Trọng tâm: Trích xuất các khái niệm chính, định nghĩa, và cấu trúc phân cấp.
+Bạn PHẢI trả về ĐÚNG MỘT JSON hợp lệ (KHÔNG có markdown code block, KHÔNG bọc trong ` + "```" + `json) với cấu trúc sau:
+{
+  "nodes": [
+    {
+      "id": "node_id_duy_nhat",
+      "label": "Tên khái niệm ngắn gọn (VD: Trí tuệ nhân tạo)",
+      "summary": "Mô tả ngắn gọn khoảng 1-2 câu về khái niệm này dựa trên tài liệu",
+      "chunk_id": "ChunkID của đoạn văn bản chứa thông tin này (lấy chính xác từ input)",
+      "page_number": số_trang (nguyên dương, lấy từ input, vd: 1)
+    }
+  ],
+  "edges": [
+    {
+      "from": "node_id_nguon",
+      "to": "node_id_dich",
+      "label": "Mối quan hệ (VD: bao gồm, dẫn đến, là loại của) - có thể để trống"
+    }
+  ]
+}
+Yêu cầu:
+- Có 1 node gốc (Root) đại diện cho chủ đề chính.
+- Từ 10 đến tối đa 30 nodes để đảm bảo chi tiết.
+- Các ID phải khớp chính xác giữa nodes và edges.
+- Chọn chunk_id và page_number tương ứng nhất cho mỗi node. Đảm bảo chunk_id có thật trong input.
+`
+
+	messages := []utils.ChatMessage{
+		{Role: "system", Content: promptSys},
+		{Role: "user", Content: fmt.Sprintf("Tài liệu: %s\n\nNội dung:\n%s", docTitle, combinedText)},
+	}
+
+	rawJSON, _, err := utils.AI.ChatNonStream(utils.ServiceChat, messages)
+	if err != nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "AI không thể tạo Mindmap lúc này"})
+		return
+	}
+
+	// 5. Parse JSON
+	rawJSON = strings.TrimSpace(rawJSON)
+	rawJSON = strings.TrimPrefix(rawJSON, "```json")
+	rawJSON = strings.TrimPrefix(rawJSON, "```")
+	rawJSON = strings.TrimSuffix(rawJSON, "```")
+	rawJSON = strings.TrimSpace(rawJSON)
+
+	// Validate json hợp lệ
+	var js map[string]interface{}
+	if err := json.Unmarshal([]byte(rawJSON), &js); err != nil {
+		log.Printf("❌ [Mindmap] JSON parse error: %v\nRaw: %s", err, rawJSON)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "AI trả về định dạng Mindmap không hợp lệ"})
+		return
+	}
+
+	// 6. Lưu vào Redis TTL 7 ngày
+	if config.RedisClient != nil {
+		config.RedisClient.Set(config.Ctx, cacheKey, rawJSON, 7*24*time.Hour)
+	}
+
+	log.Printf("✅ [Mindmap] Generated mindmap for doc %s (user: %s)", docID, userID)
+	c.Data(http.StatusOK, "application/json", []byte(rawJSON))
+}
+
+// GetMindmap lấy mindmap từ cache
+// GET /api/study/docs/:doc_id/mindmap
+func GetMindmap(c *gin.Context) {
+	docID := c.Param("doc_id")
+
+	cacheKey := "mindmap:" + docID
+	if config.RedisClient != nil {
+		cached, err := config.RedisClient.Get(config.Ctx, cacheKey).Result()
+		if err == nil {
+			c.Data(http.StatusOK, "application/json", []byte(cached))
+			return
+		}
+	}
+
+	c.JSON(http.StatusNotFound, gin.H{"error": "Mindmap chưa được tạo hoặc đã hết hạn"})
+}

@@ -42,5 +42,11 @@ func RegisterStudyToolsRoutes(rg *gin.RouterGroup) {
 		study.POST("/plans", controllers.CreateStudyPlan)
 		study.GET("/plans", controllers.GetStudyPlans)
 		study.DELETE("/plans/:id", controllers.DeleteStudyPlan)
+
+		// Mindmap endpoints
+		study.POST("/docs/:doc_id/mindmap/generate",
+			middleware.RateLimit("ai_generate", 10, time.Minute),
+			controllers.GenerateMindmap)
+		study.GET("/docs/:doc_id/mindmap", controllers.GetMindmap)
 	}
 }
