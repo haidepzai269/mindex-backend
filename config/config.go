@@ -34,6 +34,7 @@ type AppConfig struct {
 	NineRouterModel  string
 	NineRouterChatKeys []string
 	NineRouterChatModel string
+	FPTAITTSKeys []string
 }
 
 var Env AppConfig
@@ -138,6 +139,15 @@ func LoadConfig() {
 		"https://mindex.io.vn",
 		"https://mindex-frontend.haidepzai92006.workers.dev",
 	}
+
+	fptAiKeysRaw := os.Getenv("FPT_AI_TTS_KEYS")
+	var fptAiKeys []string
+	if fptAiKeysRaw != "" {
+		parts := strings.Split(fptAiKeysRaw, ",")
+		for _, v := range parts {
+			fptAiKeys = append(fptAiKeys, strings.TrimSpace(v))
+		}
+	}
 	var corsOrigins []string
 	if raw := os.Getenv("CORS_ORIGINS"); raw != "" {
 		for _, o := range strings.Split(raw, ",") {
@@ -187,5 +197,6 @@ func LoadConfig() {
 			}
 			return "Mindex2" // Default
 		}(),
+		FPTAITTSKeys: fptAiKeys,
 	}
 }

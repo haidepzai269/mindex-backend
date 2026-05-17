@@ -10,6 +10,15 @@ import (
 
 const sweeperInterval = 1 * time.Hour
 
+const (
+	tokenUsageRetention  = "90 days"
+	aiLogRetention       = "180 days"
+	closedRoomRetention  = "180 days"
+	roomMsgRetention     = "180 days"
+	readNotifRetention   = "30 days"
+	unreadNotifRetention = "90 days"
+)
+
 // StartSweeper chạy định kỳ để dọn dẹp tài liệu đã hết hạn
 func StartSweeper() {
 	log.Printf("🛠 Khởi chạy Sweeper (chu kỳ %s)...", sweeperInterval)
@@ -76,6 +85,8 @@ func RunSweeperNow() (map[string]interface{}, error) {
 		log.Println("Sweeper error (Public):", err)
 	}
 
+	retentionStats := runRetentionCleanup()
+
 	// 3. Gửi thông báo cho từng người dùng (Background)
 	go func() {
 		for _, d := range toDelete {
@@ -103,6 +114,98 @@ func RunSweeperNow() (map[string]interface{}, error) {
 	return map[string]interface{}{
 		"deleted_private": resPriv.RowsAffected(),
 		"deleted_public":  resPub.RowsAffected(),
+		"retention":       retentionStats,
 		"duration_ms":     time.Since(start).Milliseconds(),
 	}, nil
+}
+
+func runRetentionCleanup() map[string]int64 {
+	stats := map[string]int64{}
+
+	cleanups := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "token_usage_logs",
+			sql:  "DELETE FROM token_usage_logs WHERE created_at < NOW() - INTERVAL '" + tokenUsageRetention + "'",
+		},
+		{
+			name: "ai_response_logs",
+			sql:  "DELETE FROM ai_response_logs WHERE created_at < NOW() - INTERVAL '" + aiLogRetention + "'",
+		},
+		{
+			name: "ai_response_logs_orphan_documents",
+			sql: `
+				DELETE FROM ai_response_logs l
+				WHERE l.document_id IS NOT NULL
+				  AND NOT EXISTS (
+					SELECT 1 FROM documents d WHERE d.id::text = l.document_id
+				  )`,
+		},
+		{
+			name: "ai_response_logs_orphan_collections",
+			sql: `
+				DELETE FROM ai_response_logs l
+				WHERE l.collection_id IS NOT NULL
+				  AND NOT EXISTS (
+					SELECT 1 FROM collections c WHERE c.id::text = l.collection_id
+				  )`,
+		},
+		{
+			name: "ai_response_logs_orphan_users",
+			sql: `
+				DELETE FROM ai_response_logs l
+				WHERE NOT EXISTS (
+					SELECT 1 FROM users u WHERE u.id::text = l.user_id
+				)`,
+		},
+		{
+			name: "room_messages",
+			sql: `
+				DELETE FROM room_messages rm
+				USING group_rooms gr
+				WHERE rm.room_id = gr.id
+				  AND gr.closed_at IS NOT NULL
+				  AND gr.closed_at < NOW() - INTERVAL '` + roomMsgRetention + `'`,
+		},
+		{
+			name: "closed_room_documents",
+			sql: `
+				DELETE FROM documents d
+				USING group_rooms gr
+				WHERE d.room_id = gr.id
+				  AND gr.closed_at IS NOT NULL
+				  AND gr.closed_at < NOW() - INTERVAL '` + closedRoomRetention + `'`,
+		},
+		{
+			name: "closed_rooms",
+			sql: `
+				DELETE FROM group_rooms
+				WHERE closed_at IS NOT NULL
+				  AND closed_at < NOW() - INTERVAL '` + closedRoomRetention + `'`,
+		},
+		{
+			name: "notifications",
+			sql: `
+				DELETE FROM notifications
+				WHERE (read_at IS NOT NULL AND read_at < NOW() - INTERVAL '` + readNotifRetention + `')
+				   OR (read_at IS NULL AND created_at < NOW() - INTERVAL '` + unreadNotifRetention + `')`,
+		},
+		{
+			name: "shared_links",
+			sql:  "DELETE FROM shared_links WHERE expired_at IS NOT NULL AND expired_at < NOW()",
+		},
+	}
+
+	for _, cleanup := range cleanups {
+		res, err := config.DB.Exec(config.Ctx, cleanup.sql)
+		if err != nil {
+			log.Printf("[Sweeper] Retention cleanup failed for %s: %v", cleanup.name, err)
+			continue
+		}
+		stats[cleanup.name] = res.RowsAffected()
+	}
+
+	return stats
 }

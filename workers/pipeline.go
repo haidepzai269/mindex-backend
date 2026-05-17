@@ -22,7 +22,7 @@ var embedSemaphore = make(chan struct{}, maxConcurrentEmbeds)
 func RunEmbeddingPipeline(job controllers.UploadJob) error {
 	// 1. Đọc file từ Local Path (nơi Controller đã lưu tạm)
 	utils.UpdateDocProgress(job.DocID, "downloading", 10)
-	
+
 	// Tự động dọn dẹp file tạm khi pipeline hoàn tất (thành công hoặc lỗi)
 	defer os.Remove(job.LocalPath)
 
@@ -36,7 +36,6 @@ func RunEmbeddingPipeline(job controllers.UploadJob) error {
 	// 2. Tính hash để đối chiếu (Controller đã lưu hash này, nhưng Worker vẫn dùng để log/audit)
 	hash := fmt.Sprintf("%x", sha256.Sum256(fileBytes))
 
-
 	// 3. Khởi tạo Extraction & Chunking (Structure-aware)
 	utils.UpdateDocProgress(job.DocID, "extracting", 30)
 	chunks, err := utils.ExtractAndChunk(job.LocalPath, utils.CleanTextLocal)
@@ -44,7 +43,7 @@ func RunEmbeddingPipeline(job controllers.UploadJob) error {
 		utils.UpdateDocProgress(job.DocID, "error", 0)
 		return fmt.Errorf("lỗi trích xuất và chunking: %v", err)
 	}
-	
+
 	// Tái tạo cleanText để dùng cho Moderation và Classification
 	var cleanTextBuilder strings.Builder
 	for _, chunk := range chunks {
@@ -76,7 +75,7 @@ func RunEmbeddingPipeline(job controllers.UploadJob) error {
 
 	// 3b. AI Classification (Lĩnh vực) - dùng AI Orchestrator (Ưu tiên Gemini -> Cerebras -> Groq -> HF)
 	utils.UpdateDocProgress(job.DocID, "classifying", 45)
-	
+
 	classifySystemPrompt := `Bạn là chuyên gia phân loại tài liệu. Nhiệm vụ của bạn là xác định đối tượng người dùng (Persona) phù hợp nhất với tài liệu này.
 Chỉ trả về MỘT từ hoặc cụm từ ngắn gọn duy nhất (ví dụ: Sinh viên, Lập trình viên, Luật sư, Bác sĩ, Giảng viên, Học sinh, Kỹ sư, v.v.).
 TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
@@ -91,7 +90,7 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 			return cleanText
 		}())},
 	}
-	
+
 	detectedPersona, usedProvider, err := utils.AI.ChatNonStream(utils.ServiceClassify, classifyMessages)
 	if err != nil {
 		log.Printf("⚠️ [Pipeline Error] AI Classification failed for Doc %s: %v. Keeping default persona.", job.DocID, err)
@@ -103,7 +102,7 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 	// Embedding
 	utils.UpdateDocProgress(job.DocID, "embedding", 60)
 	// utils.ExtractAndChunk đã chia chunks ở bước trên
-	
+
 	log.Printf("🧩 Doc %s: Using %d structured chunks. Starting embedding...", job.DocID, len(chunks))
 
 	var wg sync.WaitGroup
@@ -134,12 +133,12 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 			// GeminiEmbedPool nhận nội dung đã được làm giàu (Enriched)
 			vec, err := utils.GeminiEmbedPool.EmbedWithRetry(finalContent, utils.CallGeminiAPI)
 			latency := int(time.Since(start).Milliseconds())
-			
+
 			if err != nil {
 				atomic.AddInt32(&errCount, 1)
 				atomic.AddInt32(&completedChunks, 1)
 				log.Printf("❌ [Embed Error] Doc %s Chunk %d: %v", job.DocID, idx, err)
-				
+
 				utils.LogTokenUsage(utils.TokenUsageLog{
 					UserID:      &job.UserID,
 					DocumentID:  &job.DocID,
@@ -183,7 +182,11 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 	wg.Wait()
 
 	if errCount > 0 {
-		log.Printf("⚠️ [Pipeline Warning] Doc %s finished with %d errors.", job.DocID, errCount)
+		log.Printf("⚠️ [Pipeline Error] Doc %s finished with %d chunk errors. Marking document as error.", job.DocID, errCount)
+		utils.UpdateDocProgress(job.DocID, "error", 0)
+		_, _ = config.DB.Exec(config.Ctx, `DELETE FROM document_chunks WHERE document_id=$1`, job.DocID)
+		_, _ = config.DB.Exec(config.Ctx, `UPDATE documents SET status='error' WHERE id=$1`, job.DocID)
+		return fmt.Errorf("embedding pipeline failed with %d chunk errors", errCount)
 	}
 
 	utils.UpdateDocProgress(job.DocID, "ready", 100)
@@ -247,5 +250,3 @@ func deleteFromCloudinary(rawURL string) error {
 	}
 	return nil
 }
-
-

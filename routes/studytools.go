@@ -48,5 +48,11 @@ func RegisterStudyToolsRoutes(rg *gin.RouterGroup) {
 			middleware.RateLimit("ai_generate", 10, time.Minute),
 			controllers.GenerateMindmap)
 		study.GET("/docs/:doc_id/mindmap", controllers.GetMindmap)
+
+		// Audio Overview endpoints
+		study.POST("/docs/:doc_id/audio/generate",
+			middleware.RateLimit("ai_generate", 10, time.Minute),
+			controllers.GenerateAudioOverview)
+		study.GET("/docs/:doc_id/audio", controllers.GetAudioOverview)
 	}
 }

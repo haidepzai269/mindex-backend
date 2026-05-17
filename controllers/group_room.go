@@ -436,7 +436,20 @@ func LinkDocToRoom(c *gin.Context) {
 		return
 	}
 
-	// 3. Kiểm tra chưa được link vào phòng này
+	// 3. Kiểm tra quota per-user (tối đa 3 tài liệu/người)
+	var userDocCount int
+	config.DB.QueryRow(config.Ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT d.id FROM documents d WHERE d.room_id = $1 AND d.user_id = $2
+			UNION
+			SELECT l.document_id FROM group_room_doc_links l WHERE l.room_id = $1 AND l.linked_by = $2
+		) sub`, roomID, userID).Scan(&userDocCount)
+	if userDocCount >= 3 {
+		c.JSON(403, gin.H{"success": false, "error": "ROOM_DOC_LIMIT", "message": "Tối đa 3 tài liệu/người trong một phòng."})
+		return
+	}
+
+	// 4. Kiểm tra chưa được link vào phòng này
 	var alreadyLinked bool
 	config.DB.QueryRow(config.Ctx, `
 		SELECT EXISTS(
@@ -448,7 +461,7 @@ func LinkDocToRoom(c *gin.Context) {
 		return
 	}
 
-	// 4. Insert link
+	// 5. Insert link
 	_, err = config.DB.Exec(config.Ctx, `
 		INSERT INTO group_room_doc_links (room_id, document_id, linked_by)
 		VALUES ($1, $2, $3)`, roomID, req.DocumentID, userID)
@@ -458,7 +471,7 @@ func LinkDocToRoom(c *gin.Context) {
 		return
 	}
 
-	// 5. Broadcast WS event
+	// 6. Broadcast WS event
 	var userName string
 	config.DB.QueryRow(config.Ctx, `SELECT name FROM users WHERE id = $1`, userID).Scan(&userName)
 	ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{

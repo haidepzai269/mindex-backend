@@ -3,6 +3,7 @@ package controllers
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"mindex-backend/config"
 	"mindex-backend/internal/ws"
 	"mindex-backend/models"
@@ -49,8 +50,8 @@ func ConnectRoomWS(c *gin.Context) {
 		config.RedisClient.Set(config.Ctx, fmt.Sprintf("room_last_seen:%s:%s", roomID, userID), time.Now().Format(time.RFC3339), 7*24*time.Hour)
 	}
 
-	// Gửi 20 tin nhắn gần nhất cho client vừa join
-	go sendRoomHistory(client, roomID)
+	// Gửi history đồng bộ trước khi bắt đầu read loop để tránh race với close(client.Send)
+	sendRoomHistory(client, roomID)
 
 	// Broadcast user online
 	var userName string
@@ -338,6 +339,8 @@ func parseRoomMessage(text, roomID string) ParsedMessage {
 
 // handleRoomAI xử lý AI response khi @MindexAI được gọi
 func handleRoomAI(roomID, callerUserID, query string) {
+	log.Printf("🤖 [RoomAI] Start room=%s caller=%s query=%q", roomID, callerUserID, query)
+
 	// Redis lock để tránh nhiều AI cùng lúc
 	lockKey := fmt.Sprintf("ai_lock:room:%s", roomID)
 	if config.RedisClient != nil {
@@ -360,6 +363,7 @@ func handleRoomAI(roomID, callerUserID, query string) {
 
 	ragContext := buildGroupRoomContext(roomID, query)
 	chatHistory := getRoomChatHistory(roomID, 10)
+	log.Printf("🧠 [RoomAI] room=%s context_len=%d history_len=%d", roomID, len(ragContext), len(chatHistory))
 
 	systemMsg := fmt.Sprintf(`Bạn là MindexAI, trợ lý học tập cho phòng học nhóm. Hãy trả lời dựa trên tài liệu bên dưới.
 
@@ -374,14 +378,24 @@ func handleRoomAI(roomID, callerUserID, query string) {
 		{Role: "user", Content: query},
 	}
 
-	answer, _, err := utils.AI.ChatNonStream(utils.ServiceChat, messages)
+	answer, usedProvider, err := utils.AI.ChatNonStream(utils.ServiceChat, messages)
 	if err != nil {
+		log.Printf("❌ [RoomAI] room=%s provider_error=%v", roomID, err)
 		ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{
 			Type: "ai_error", RoomID: roomID,
 			Payload: gin.H{"message": "MindexAI không phản hồi, thử lại sau."},
 		})
 		return
 	}
+	if strings.TrimSpace(answer) == "" {
+		log.Printf("❌ [RoomAI] room=%s provider=%s returned empty answer after non-stream success", roomID, usedProvider)
+		ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{
+			Type: "ai_error", RoomID: roomID,
+			Payload: gin.H{"message": "MindexAI không tạo được câu trả lời hợp lệ, thử lại sau."},
+		})
+		return
+	}
+	log.Printf("✅ [RoomAI] room=%s provider=%s answer_len=%d", roomID, usedProvider, len(answer))
 
 	// Broadcast theo từng chunk giả lập (non-stream)
 	words := strings.Fields(answer)
@@ -447,9 +461,21 @@ func getRoomChatHistory(roomID string, n int) string {
 // buildGroupRoomContext lấy toàn bộ chunks từ tài liệu trong phòng
 func buildGroupRoomContext(roomID, query string) string {
 	rows, err := config.DB.Query(config.Ctx, `
-		SELECT id FROM documents 
-		WHERE room_id = $1 AND status = 'ready'`, roomID)
+		SELECT DISTINCT doc_id
+		FROM (
+			SELECT id AS doc_id
+			FROM documents
+			WHERE room_id = $1 AND status = 'ready'
+
+			UNION
+
+			SELECT l.document_id AS doc_id
+			FROM group_room_doc_links l
+			JOIN documents d ON d.id = l.document_id
+			WHERE l.room_id = $1 AND d.status = 'ready'
+		) room_docs`, roomID)
 	if err != nil {
+		log.Printf("❌ [RoomAI] buildGroupRoomContext room=%s doc query error: %v", roomID, err)
 		return ""
 	}
 	defer rows.Close()
@@ -461,18 +487,32 @@ func buildGroupRoomContext(roomID, query string) string {
 		docIDs = append(docIDs, id)
 	}
 	if len(docIDs) == 0 {
+		log.Printf("⚠️ [RoomAI] room=%s has no ready docs for query=%q", roomID, query)
 		return "Chưa có tài liệu nào trong phòng."
 	}
+	log.Printf("📚 [RoomAI] room=%s query=%q doc_count=%d", roomID, query, len(docIDs))
 
 	// Dùng hybrid_search hiện có với filter room docs
 	chunks, err := utils.HybridSearchByDocIDs(docIDs, query, 8)
 	if err != nil || len(chunks) == 0 {
+		if err != nil {
+			log.Printf("❌ [RoomAI] room=%s hybrid search error: %v", roomID, err)
+		} else {
+			log.Printf("⚠️ [RoomAI] room=%s hybrid search returned 0 chunks for query=%q", roomID, query)
+		}
 		return "Không tìm thấy nội dung liên quan trong tài liệu của phòng."
 	}
+	log.Printf("🔎 [RoomAI] room=%s hybrid search returned %d chunks", roomID, len(chunks))
 
 	var sb strings.Builder
 	for i, c := range chunks {
-		sb.WriteString(fmt.Sprintf("[%d] %s\n\n", i+1, c))
+		content := strings.TrimSpace(c)
+		preview := content
+		if len(preview) > 180 {
+			preview = preview[:180]
+		}
+		log.Printf("📄 [RoomAI] room=%s chunk[%d] content_len=%d preview=%q", roomID, i, len(content), preview)
+		sb.WriteString(fmt.Sprintf("[%d]\n%s\n\n", i+1, content))
 	}
 	return sb.String()
 }

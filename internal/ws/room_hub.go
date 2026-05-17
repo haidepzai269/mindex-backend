@@ -12,11 +12,12 @@ import (
 
 // RoomClient đại diện kết nối WS của một thành viên trong phòng
 type RoomClient struct {
-	Hub    *RoomHub
-	Conn   *websocket.Conn
-	UserID string
-	RoomID string
-	Send   chan []byte
+	Hub            *RoomHub
+	Conn           *websocket.Conn
+	UserID         string
+	RoomID         string
+	Send           chan []byte
+	unregisterOnce sync.Once
 }
 
 // RoomHub quản lý tất cả kết nối WS theo phòng
@@ -112,10 +113,11 @@ func (h *RoomHub) Run() {
 					if len(roomClients) == 0 {
 						delete(h.rooms, client.RoomID)
 					}
+
+					log.Printf("🚪 [RoomHub] Socket %p for user %s disconnected from room %s", client, client.UserID, client.RoomID)
 				}
 			}
 			h.mu.Unlock()
-			log.Printf("🚪 [RoomHub] User %s disconnected from room %s", client.UserID, client.RoomID)
 		}
 	}
 }
@@ -139,7 +141,7 @@ func (h *RoomHub) BroadcastToRoom(roomID string, msg interface{}) {
 		select {
 		case client.Send <- payload:
 		default:
-			go func(c *RoomClient) { h.Unregister <- c }(client)
+			go client.RequestUnregister()
 		}
 	}
 }
@@ -166,9 +168,15 @@ func (h *RoomHub) BroadcastToRoomExcept(roomID, excludeUserID string, msg interf
 		select {
 		case client.Send <- payload:
 		default:
-			go func(c *RoomClient) { h.Unregister <- c }(client)
+			go client.RequestUnregister()
 		}
 	}
+}
+
+func (c *RoomClient) RequestUnregister() {
+	c.unregisterOnce.Do(func() {
+		c.Hub.Unregister <- c
+	})
 }
 
 // GetOnlineUsers lấy danh sách userID đang kết nối WS trong phòng
@@ -203,7 +211,7 @@ func (h *RoomHub) GetRoomClientCount(roomID string) int {
 // readPump đọc message từ client WS
 func (c *RoomClient) ReadPump(onMessage func(msg []byte)) {
 	defer func() {
-		c.Hub.Unregister <- c
+		c.RequestUnregister()
 		c.Conn.Close()
 	}()
 	for {

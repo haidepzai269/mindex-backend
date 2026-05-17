@@ -4,16 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"mindex-backend/config"
 	"mindex-backend/internal/persona"
 	"mindex-backend/utils"
 	"net/http"
 	"time"
-	"log"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 )
+
+const maxStoredChatMessages = 80
 
 type ChatRequest struct {
 	DocumentID    string `json:"document_id"`
@@ -63,7 +65,7 @@ func ChatMessage(c *gin.Context) {
 	}
 
 	log.Printf("📥 [CHAT] [User: %s] [Doc: %s] [Col: %s] [Session: %s] Question: %s", userID, req.DocumentID, req.CollectionID, req.SessionID, req.Question)
-	
+
 	// --- MỚI: KIỂM TRA HẾT HẠN (EXPIRED CHECK) ---
 	var expiredAt *time.Time
 	var targetTitle string
@@ -86,14 +88,14 @@ func ChatMessage(c *gin.Context) {
 	if expiredAt != nil && expiredAt.Before(time.Now()) {
 		log.Printf("🚫 [CHAT] Access Denied: %s has expired at %v", targetTitle, expiredAt)
 		c.JSON(403, gin.H{
-			"success": false, 
-			"error": "EXPIRED", 
+			"success": false,
+			"error":   "EXPIRED",
 			"message": "Tài liệu này đã hết hạn và đang chờ hệ thống dọn dẹp. Bạn không thể tiếp tục trò chuyện.",
 		})
 		return
 	}
 	// ---------------------------------------------
-	
+
 	// Survival of the Fittest: Gia hạn nếu là tài liệu cộng đồng
 	if req.DocumentID != "" {
 		go RefreshPublicDocExpiry(req.DocumentID)
@@ -105,14 +107,14 @@ func ChatMessage(c *gin.Context) {
 		var err error
 		if req.CollectionID != "" {
 			err = config.DB.QueryRow(config.Ctx, `
-				SELECT EXISTS(SELECT 1 FROM chat_histories WHERE session_id = $1 AND collection_id = $2 AND user_id = $3)`, 
+				SELECT EXISTS(SELECT 1 FROM chat_histories WHERE session_id = $1 AND collection_id = $2 AND user_id = $3)`,
 				req.SessionID, req.CollectionID, userID).Scan(&exists)
 		} else {
 			err = config.DB.QueryRow(config.Ctx, `
-				SELECT EXISTS(SELECT 1 FROM chat_histories WHERE session_id = $1 AND document_id = $2 AND user_id = $3)`, 
+				SELECT EXISTS(SELECT 1 FROM chat_histories WHERE session_id = $1 AND document_id = $2 AND user_id = $3)`,
 				req.SessionID, req.DocumentID, userID).Scan(&exists)
 		}
-		
+
 		if err != nil {
 			log.Printf("⚠️ [CHAT] [Session Check Error] %v", err)
 		}
@@ -152,7 +154,7 @@ Bạn đang trả lời dựa trên BỘ TÀI LIỆU gồm nhiều file liên qu
 				INSERT INTO chat_histories (user_id, document_id, session_id, full_messages, started_at) 
 				VALUES ($1, $2, $3, '[]'::jsonb, NOW())`, userID, req.DocumentID, req.SessionID)
 		}
-		
+
 		if err != nil {
 			log.Printf("❌ [DB Error] Failed to create session: %v", err)
 		}
@@ -186,7 +188,7 @@ Bạn đang trả lời dựa trên BỘ TÀI LIỆU gồm nhiều file liên qu
 			FROM shared_links sl
 			JOIN users u ON u.id = sl.creator_id
 			WHERE sl.id = $1`, req.ForkID).Scan(&sharedSummary, &sharedDocID, &creatorName)
-		
+
 		if forkErr == nil && sharedSummary != nil {
 			systemPrompt = fmt.Sprintf(`%s
 
@@ -209,12 +211,8 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		"timestamp": time.Now().Format(time.RFC3339),
 	}
 	userMsgBytes, _ := json.Marshal(userMsg)
-	_, userErr := config.DB.Exec(config.Ctx, `
-		UPDATE chat_histories 
-		SET full_messages = full_messages || $1::jsonb, 
-		    message_count = message_count + 1 
-		WHERE session_id = $2`, string(userMsgBytes), req.SessionID)
-	
+	userErr := appendChatHistoryMessage(config.Ctx, req.SessionID, string(userMsgBytes))
+
 	if userErr != nil {
 		log.Printf("❌ [DB Error] Failed to save user message: %v", userErr)
 	} else {
@@ -240,7 +238,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		// Timeout ngắn cho Redis để không block request chính
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		
+
 		rawHistory, err := config.RedisClient.LRange(ctx, historyKey, 0, -1).Result()
 		if err == nil {
 			for _, item := range rawHistory {
@@ -293,7 +291,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 
 	// 5. Build prompt & Call AI
 	log.Printf("🤖 RAG: Context Length: %d chars", len(contextText))
-	
+
 	// Fallback logic (SYS-013): Nếu không có context, dùng prompt chuyên biệt để trả lời lịch sự
 	if contextText == "" {
 		systemPrompt = personaCfg.PromptNoContext
@@ -313,9 +311,9 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 	// 6. Gửi sang AI Orchestrator (Tự động quản lý NineRouter -> Groq -> Cerebras -> Mistral -> OpenRouter)
 	log.Printf("🚀 [CHAT] Đang gửi yêu cầu tới AI Orchestrator cho session: %s", req.SessionID)
 	chatStart := time.Now()
-	
+
 	fullAnswer, usedProvider, streamErr := utils.AI.ChatStream(utils.ServiceChat, c, messages, req.Model)
-	
+
 	chatLatency := int(time.Since(chatStart).Milliseconds())
 
 	// Ghi AI Response Log:
@@ -340,7 +338,6 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		go SaveAIResponseLogWithID(entry) // Lưu DB async, ID đã biết trước
 	}
 
-
 	// Log token usage (approximate)
 	go func() {
 		status := "ok"
@@ -348,8 +345,14 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 			status = "error"
 		}
 		utils.LogTokenUsage(utils.TokenUsageLog{
-			UserID:      &userID,
-			DocumentID:  func() *string { s := req.DocumentID; if s == "" { return nil }; return &s }(),
+			UserID: &userID,
+			DocumentID: func() *string {
+				s := req.DocumentID
+				if s == "" {
+					return nil
+				}
+				return &s
+			}(),
 			SessionID:   req.SessionID,
 			Service:     string(usedProvider),
 			Operation:   "chat",
@@ -397,20 +400,16 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 					"id":        uuid.New().String(),
 					"role":      "assistant",
 					"content":   fullAnswer,
-					"sources":    sources,
+					"sources":   sources,
 					"timestamp": time.Now().Format(time.RFC3339),
 				}
 				asstMsgBytes, _ := json.Marshal(assistantMsg)
-				_, err := config.DB.Exec(context.Background(), `
-					UPDATE chat_histories 
-					SET full_messages = full_messages || $1::jsonb, 
-						message_count = message_count + 1 
-					WHERE session_id = $2`, string(asstMsgBytes), req.SessionID)
-				
+				err := appendChatHistoryMessage(context.Background(), req.SessionID, string(asstMsgBytes))
+
 				if err != nil {
 					log.Printf("❌ [DB Error] Failed to save assistant message: %v", err)
 				}
-				
+
 				if req.CollectionID != "" {
 					config.DB.Exec(context.Background(), `UPDATE collections SET last_chat_at=NOW() WHERE id=$1`, req.CollectionID)
 				}
@@ -434,6 +433,23 @@ func getCollectionDocumentIDsHelper(colID string) ([]string, error) {
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+func appendChatHistoryMessage(ctx context.Context, sessionID string, messageJSON string) error {
+	_, err := config.DB.Exec(ctx, `
+		UPDATE chat_histories
+		SET full_messages = (
+				SELECT COALESCE(jsonb_agg(value ORDER BY ord), '[]'::jsonb)
+				FROM (
+					SELECT value, ord
+					FROM jsonb_array_elements(COALESCE(full_messages, '[]'::jsonb) || $1::jsonb) WITH ORDINALITY AS e(value, ord)
+					ORDER BY ord DESC
+					LIMIT $3
+				) kept
+			),
+			message_count = message_count + 1
+		WHERE session_id = $2`, messageJSON, sessionID, maxStoredChatMessages)
+	return err
 }
 
 func buildRAGPrompt(sys, hist, ctx, curr string) string {

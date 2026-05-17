@@ -94,7 +94,7 @@ func GenerateFlashcards(c *gin.Context) {
 	config.DB.QueryRow(config.Ctx, `SELECT COUNT(*) FROM flashcard_sets WHERE doc_id = $1`, docID).Scan(&existingSets)
 	if existingSets >= 2 {
 		c.JSON(http.StatusForbidden, gin.H{
-			"error": "LIMIT_REACHED", 
+			"error":   "LIMIT_REACHED",
 			"message": "Tài liệu này đã đạt giới hạn 2 lần tạo Flashcard. Vui lòng sử dụng các bộ thẻ đã có.",
 		})
 		return
@@ -219,10 +219,10 @@ Yêu cầu:
 		rawJSON, fallbackErr = utils.ChatOpenAINonStream(cfgGroq, messages)
 	}
 
-	// 3. Nếu vẫn lỗi hoặc kết quả rỗng, thử Gemini
+	// 3. Nếu vẫn lỗi hoặc kết quả rỗng, thử Groq
 	if fallbackErr != nil || rawJSON == "" {
-		log.Printf("⚠️ [Flashcard] Groq lỗi hoặc trả về rỗng: %v. Thử Provider: Gemini", fallbackErr)
-		rawJSON, fallbackErr = utils.GeminiChatNonStreamWithModel(messages, "gemini-2.0-flash-exp")
+		log.Printf("⚠️ [Flashcard] Groq lỗi hoặc trả về rỗng: %v. Thử Provider: Groq", fallbackErr)
+		rawJSON, fallbackErr = utils.StreamGroqChatNonStream(messages)
 	}
 
 	if fallbackErr != nil || rawJSON == "" {
@@ -285,16 +285,16 @@ Yêu cầu:
 	}
 
 	log.Printf("✅ [Flashcard] Generated %d cards for doc %s (user: %s)", len(cards), docID, userID)
-	
+
 	// Xóa cache danh sách bộ thẻ của doc này trong Redis (nếu có)
 	if config.RedisClient != nil {
 		config.RedisClient.Del(config.Ctx, "doc_flashcard_sets:"+docID)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"success":  true,
-		"set_id":   setID,
-		"count":    len(cards),
+		"success":   true,
+		"set_id":    setID,
+		"count":     len(cards),
 		"is_capped": tier == "free" && len(cards) >= FreeFlashcardLimit,
 	})
 }
@@ -718,8 +718,8 @@ Yêu cầu:
 
 	log.Printf("✅ [Quiz] Generated quiz %s with %d questions for doc %s", quizID, len(items), docID)
 	c.JSON(http.StatusOK, gin.H{
-		"success":       true,
-		"quiz_id":       quizID,
+		"success":        true,
+		"quiz_id":        quizID,
 		"question_count": len(items),
 	})
 }
@@ -926,11 +926,11 @@ func GetMasteryScore(c *gin.Context) {
 	masteryScore := (flashcardScore*0.5 + avgQuizScore*0.5)
 
 	c.JSON(http.StatusOK, gin.H{
-		"success":          true,
-		"mastery_score":    masteryScore,
-		"flashcard_score":  flashcardScore,
-		"quiz_score":       avgQuizScore,
-		"flashcard_stats":  gin.H{"total": totalCards, "remembered": rememberedCards},
+		"success":         true,
+		"mastery_score":   masteryScore,
+		"flashcard_score": flashcardScore,
+		"quiz_score":      avgQuizScore,
+		"flashcard_stats": gin.H{"total": totalCards, "remembered": rememberedCards},
 	})
 }
 

@@ -17,6 +17,7 @@ const (
 	ServiceSummary  ServiceType = "SUMMARY"
 	ServiceClassify ServiceType = "CLASSIFY"
 	ServiceSearch   ServiceType = "SEARCH"
+	ServiceAudio    ServiceType = "AUDIO"
 )
 
 // ProviderType định nghĩa loại Provider
@@ -34,11 +35,11 @@ const (
 
 // AIProviderConfig chứa thông tin cấu hình cho một Provider cụ thể trong một Service
 type AIProviderConfig struct {
-	Type      ProviderType
-	Model     string
-	Pool      *ApiKeyPool
-	IsOpenAI  bool   // Nếu true, dùng OpenAI Adapter
-	BaseURL   string // Dùng cho OpenAI-compatible APIs
+	Type     ProviderType
+	Model    string
+	Pool     *ApiKeyPool
+	IsOpenAI bool   // Nếu true, dùng OpenAI Adapter
+	BaseURL  string // Dùng cho OpenAI-compatible APIs
 }
 
 // AIOrchestrator quản lý việc điều phối các Provider
@@ -92,6 +93,13 @@ func InitOrchestrator() {
 		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
 		{Type: ProviderHF, Model: "meta-llama/Llama-3.2-3B-Instruct", Pool: HFPool, IsOpenAI: false},
+	}
+
+	// 5. AUDIO OVERVIEW - Ưu tiên Groq, fallback NineRouter, rồi Gemini
+	AI.Priorities[ServiceAudio] = []AIProviderConfig{
+		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
+		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
+		{Type: ProviderGemini, Model: "gemini-1.5-flash", Pool: GeminiChatPool, IsOpenAI: false},
 	}
 }
 
@@ -148,7 +156,7 @@ func (o *AIOrchestrator) ChatStream(service ServiceType, c *gin.Context, message
 
 		lastErr = err
 		log.Printf("⚠️ [Orchestrator] [%s] Provider %s lỗi: %v. Đang fallback...", service, cfg.Type, err)
-		
+
 		if strings.Contains(err.Error(), "broken pipe") || strings.Contains(err.Error(), "context canceled") {
 			return answer, cfg.Type, err
 		}
@@ -167,7 +175,7 @@ func (o *AIOrchestrator) ChatNonStream(service ServiceType, messages []ChatMessa
 			continue
 		}
 
-		log.Printf("🌐 [Orchestrator-NS] [%s] Thử Provider: %s", service, cfg.Type)
+		log.Printf("🌐 [Orchestrator-NS] [%s] Thử Provider: %s (Model: %s)", service, cfg.Type, cfg.Model)
 
 		var answer string
 		var err error
@@ -177,19 +185,24 @@ func (o *AIOrchestrator) ChatNonStream(service ServiceType, messages []ChatMessa
 		} else if cfg.Type == ProviderGemini {
 			answer, err = GeminiChatNonStreamWithModel(messages, cfg.Model)
 		} else if cfg.Type == ProviderHF {
-            if service == ServiceClassify {
-                answer, err = ClassifyPersonaWithHF(messages[len(messages)-1].Content)
-            } else if service == ServiceSearch {
-                answer, err = RewriteQueryForSearch(messages[len(messages)-1].Content)
-            }
+			if service == ServiceClassify {
+				answer, err = ClassifyPersonaWithHF(messages[len(messages)-1].Content)
+			} else if service == ServiceSearch {
+				answer, err = RewriteQueryForSearch(messages[len(messages)-1].Content)
+			}
 		}
 
 		if err == nil {
-			return answer, cfg.Type, nil
+			if strings.TrimSpace(answer) == "" {
+				err = fmt.Errorf("provider %s trả về answer rỗng", cfg.Type)
+			} else {
+				log.Printf("✅ [Orchestrator-NS] [%s] Thành công với %s (%d chars)", service, cfg.Type, len(answer))
+				return answer, cfg.Type, nil
+			}
 		}
 
 		lastErr = err
-		log.Printf("⚠️ [Orchestrator-NS] [%s] Provider %s lỗi: %v", service, cfg.Type, err)
+		log.Printf("⚠️ [Orchestrator-NS] [%s] Provider %s lỗi: %v. Đang fallback...", service, cfg.Type, err)
 	}
 
 	return "", "", fmt.Errorf("tất cả các provider đều thất bại: %v", lastErr)

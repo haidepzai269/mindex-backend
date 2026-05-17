@@ -11,10 +11,21 @@ import (
 )
 
 func main() {
-	godotenv.Load("../.env")
+	godotenv.Load(".env", "../.env")
+
 	dbURL := os.Getenv("DATABASE_URL_CLOUD")
 	if dbURL == "" {
 		log.Fatal("DATABASE_URL_CLOUD is not set")
+	}
+
+	sqlPath := "migrations/update_persona_v2.sql"
+	if len(os.Args) > 1 {
+		sqlPath = os.Args[1]
+	}
+
+	sqlBytes, err := os.ReadFile(sqlPath)
+	if err != nil {
+		log.Fatalf("Error reading SQL file: %v", err)
 	}
 
 	conn, err := pgx.Connect(context.Background(), dbURL)
@@ -23,16 +34,9 @@ func main() {
 	}
 	defer conn.Close(context.Background())
 
-	sqlPath := "../migrations/update_persona_v2.sql"
-	sqlBytes, err := os.ReadFile(sqlPath)
-	if err != nil {
-		log.Fatalf("Error reading SQL file: %v", err)
-	}
-
-	_, err = conn.Exec(context.Background(), string(sqlBytes))
-	if err != nil {
+	if _, err = conn.Exec(context.Background(), string(sqlBytes)); err != nil {
 		log.Fatalf("Error executing SQL: %v", err)
 	}
 
-	fmt.Println("🎉 Database prompts updated successfully to v2.0!")
+	fmt.Printf("Migration applied successfully: %s\n", sqlPath)
 }
