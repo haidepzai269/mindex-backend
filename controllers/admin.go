@@ -118,12 +118,12 @@ func AdminTokenOverview(c *gin.Context) {
 		var count, tokens, latency, errors int
 		rows.Scan(&s, &o, &count, &tokens, &latency, &errors)
 		breakdown = append(breakdown, gin.H{
-			"service":      s,
-			"operation":    o,
-			"requests":     count,
-			"tokens":       tokens,
-			"avg_latency":  latency,
-			"error_count":  errors,
+			"service":     s,
+			"operation":   o,
+			"requests":    count,
+			"tokens":      tokens,
+			"avg_latency": latency,
+			"error_count": errors,
 		})
 	}
 
@@ -200,13 +200,13 @@ func AdminGetChatDetail(c *gin.Context) {
 	sessionID := c.Param("session_id")
 
 	var chat struct {
-		ID            string          `json:"id"`
-		Email         string          `json:"user_email"`
-		Summary       string          `json:"summary"`
-		FullMessages  json.RawMessage `json:"messages"`
-		Flagged       bool            `json:"flagged"`
-		FlagReason    string          `json:"flag_reason"`
-		StartedAt     time.Time       `json:"started_at"`
+		ID           string          `json:"id"`
+		Email        string          `json:"user_email"`
+		Summary      string          `json:"summary"`
+		FullMessages json.RawMessage `json:"messages"`
+		Flagged      bool            `json:"flagged"`
+		FlagReason   string          `json:"flag_reason"`
+		StartedAt    time.Time       `json:"started_at"`
 	}
 
 	err := config.DB.QueryRow(config.Ctx, `
@@ -303,7 +303,7 @@ func AdminKeyStream(c *gin.Context) {
 	ch := pubsub.Channel()
 
 	clientGone := c.Writer.CloseNotify()
-	
+
 	log.Printf("📡 [SSE] Admin connected to KeyStream")
 
 	for {
@@ -326,12 +326,14 @@ func AdminQuotaSummary(c *gin.Context) {
 	}
 
 	summaries := quota.GlobalTracker.GetProviderSummary()
-	
+
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data": gin.H{
-			"updated_at": time.Now(),
-			"providers":  summaries,
+			"updated_at":           time.Now(),
+			"providers":            summaries,
+			"web_search_enabled":   config.Env.WebSearchEnabled,
+			"web_search_providers": utils.GetWebSearchQuotaStatus(config.Ctx),
 		},
 	})
 }

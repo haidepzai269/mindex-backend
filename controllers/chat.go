@@ -9,6 +9,7 @@ import (
 	"mindex-backend/internal/persona"
 	"mindex-backend/utils"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -25,6 +26,7 @@ type ChatRequest struct {
 	UseSystemDocs bool   `json:"use_system_docs"`
 	ForkID        string `json:"fork_id"` // ID của shared_link nếu đây là fork session
 	Model         string `json:"model"`   // Mindex-1 hoặc Mindex-2
+	Thinking      bool   `json:"thinking"`
 }
 
 type QAHistory struct {
@@ -42,6 +44,7 @@ func ChatMessage(c *gin.Context) {
 		req.UseSystemDocs = c.Query("system") == "true"
 		req.ForkID = c.Query("fork_id")
 		req.Model = c.Query("model")
+		req.Thinking = c.Query("thinking") == "true"
 	} else {
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(400, gin.H{"success": false, "error": "VALIDATION_ERROR", "message": "Tham số không hợp lệ"})
@@ -63,6 +66,8 @@ func ChatMessage(c *gin.Context) {
 	if userPersona == "" {
 		userPersona = "student"
 	}
+	userTier := getUserTierForChat(userID, c.GetString("role"))
+	thinkingMode := req.Thinking && isTierAllowedThinking(userTier)
 
 	log.Printf("📥 [CHAT] [User: %s] [Doc: %s] [Col: %s] [Session: %s] Question: %s", userID, req.DocumentID, req.CollectionID, req.SessionID, req.Question)
 
@@ -281,9 +286,12 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		}
 
 		sources = append(sources, map[string]interface{}{
+			"type":        "document",
 			"chunk_index": res.ChunkIndex,
 			"page":        res.PageNumber,
+			"page_number": res.PageNumber,
 			"score":       res.Score,
+			"similarity":  res.Score,
 			"content":     res.RetrievalContent,
 			"doc_title":   res.DocTitle,
 		})
@@ -291,6 +299,67 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 
 	// 5. Build prompt & Call AI
 	log.Printf("🤖 RAG: Context Length: %d chars", len(contextText))
+
+	var webSearchMeta gin.H
+	if config.Env.WebSearchEnabled {
+		webPlan := utils.DecideWebSearch(req.Question, searchQuery, contextText, docIntelStr, userPersona, userTier, thinkingMode)
+		webSearchMeta = gin.H{
+			"requested": req.Thinking,
+			"thinking":  thinkingMode,
+			"decision":  webPlan.UseWebSearch,
+			"query":     webPlan.Query,
+			"reason":    webPlan.Reason,
+		}
+
+		if webPlan.UseWebSearch {
+			allowed, retryAfter := utils.CheckWebSearchUserLimit(context.Background(), userID, userTier)
+			if !allowed {
+				log.Printf("⚠️ [CHAT] Web search user limit reached user=%s tier=%s retry_after=%s", userID, userTier, retryAfter)
+				webSearchMeta["used"] = false
+				webSearchMeta["rate_limited"] = true
+				webSearchMeta["retry_after_seconds"] = int(retryAfter.Seconds())
+				webSearchMeta["error"] = "web search user rate limit reached"
+			} else {
+				writeChatStatus(c, flusher, "searching")
+				webCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+				webResp, err := utils.SearchWeb(webCtx, webPlan)
+				cancel()
+				writeChatStatus(c, flusher, "thinking")
+				if err != nil {
+					log.Printf("⚠️ [CHAT] Web search skipped after decision: %v", err)
+					webSearchMeta["error"] = err.Error()
+				} else {
+					webContext := utils.FormatWebSearchContext(webResp)
+					if webContext != "" {
+						contextText += "\n\n" + webContext
+						sources = append(sources, utils.WebSearchSources(webResp)...)
+						systemPrompt += buildWebSearchPromptRules(userPersona, thinkingMode)
+						webSearchMeta["used"] = true
+						webSearchMeta["provider"] = webResp.Provider
+						webSearchMeta["from_cache"] = webResp.FromCache
+						webSearchMeta["results"] = len(webResp.Results)
+						log.Printf("🌐 [CHAT] Web search used provider=%s cache=%t results=%d", webResp.Provider, webResp.FromCache, len(webResp.Results))
+					}
+				}
+			}
+		} else {
+			log.Printf("🌐 [CHAT] Web search decision=false reason=%s", webPlan.Reason)
+		}
+	} else if req.Thinking {
+		webSearchMeta = gin.H{
+			"requested": true,
+			"thinking":  thinkingMode,
+			"used":      false,
+			"reason":    "web search disabled",
+		}
+	}
+
+	if thinkingMode {
+		systemPrompt += `
+
+[THINKING MODE]
+User đã bật chế độ Thinking cho câu hỏi này. Hãy phân tích kỹ hơn, kiểm tra mâu thuẫn giữa tài liệu và nguồn bổ sung nếu có, và trả lời có cấu trúc rõ ràng. Không bịa nguồn.`
+	}
 
 	// Fallback logic (SYS-013): Nếu không có context, dùng prompt chuyên biệt để trả lời lịch sự
 	if contextText == "" {
@@ -376,6 +445,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		"message_id": uuid.New().String(),
 		"log_id":     logID, // Dùng cho thumbs up/down UI
 		"sources":    sources,
+		"web_search": webSearchMeta,
 	}
 	doneBytes, _ := json.Marshal(donePayload)
 	fmt.Fprintf(c.Writer, "event: done\ndata: %s\n\n", string(doneBytes))
@@ -464,4 +534,48 @@ func buildRAGPrompt(sys, hist, ctx, curr string) string {
 [CÂU HỎI HIỆN TẠI]
 %s
 `, sys, hist, ctx, curr)
+}
+
+func writeChatStatus(c *gin.Context, flusher http.Flusher, status string) {
+	payload, _ := json.Marshal(gin.H{"status": status})
+	fmt.Fprintf(c.Writer, "event: status\ndata: %s\n\n", string(payload))
+	flusher.Flush()
+}
+
+func getUserTierForChat(userID string, role string) string {
+	if role == "admin" {
+		return "ADMIN"
+	}
+	var tier string
+	err := config.DB.QueryRow(config.Ctx, `SELECT COALESCE(tier, 'FREE') FROM users WHERE id = $1`, userID).Scan(&tier)
+	if err != nil || strings.TrimSpace(tier) == "" {
+		return "FREE"
+	}
+	return strings.ToUpper(strings.TrimSpace(tier))
+}
+
+func isTierAllowedThinking(tier string) bool {
+	tier = strings.ToUpper(strings.TrimSpace(tier))
+	return tier == "PRO" || tier == "ULTRA" || tier == "ADMIN"
+}
+
+func buildWebSearchPromptRules(userPersona string, thinkingMode bool) string {
+	rules := `
+
+[WEB SEARCH RULES]
+Bạn có thêm [WEB SEARCH CONTEXT] từ nguồn web bên ngoài tài liệu.
+1. Chỉ dùng web context để xác minh hoặc bổ sung thông tin liên quan đến tài liệu/câu hỏi.
+2. Khi dùng web context, nêu nguồn bằng tên trang hoặc URL ngắn. Không trình bày web context như thể nó nằm trong tài liệu gốc.
+3. Nếu web context mâu thuẫn với tài liệu, nêu rõ phần nào từ tài liệu và phần nào từ web.
+4. Nếu nguồn web không đủ chắc, nói rõ mức độ không chắc chắn.`
+
+	if userPersona == "doctor" || userPersona == "legal" {
+		rules += `
+5. Với nội dung y khoa/pháp lý: chỉ trả lời trong phạm vi liên quan đến tài liệu; không biến web search thành tư vấn chuyên môn thay thế bác sĩ/luật sư hoặc văn bản chính thức.`
+	}
+	if thinkingMode {
+		rules += `
+6. Thinking mode đang bật: ưu tiên kiểm chứng kỹ và giải thích ngắn gọn vì sao nguồn web có liên quan.`
+	}
+	return rules
 }
