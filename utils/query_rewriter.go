@@ -3,11 +3,39 @@ package utils
 import (
 	"fmt"
 	"log"
+	"strings"
 )
+
+// ambiguousReferenceTokens là các đại từ/từ chỉ định mà nếu xuất hiện trong câu hỏi
+// thì cần dùng history để làm rõ. Nếu không có, query đã tự đủ nghĩa.
+var ambiguousReferenceTokens = []string{
+	// Tiếng Việt
+	"nó", "cái đó", "chúng", "họ", "điều này", "điều đó", "cái này", "cái kia",
+	"phương pháp đó", "khái niệm đó", "khái niệm trên", "phương pháp trên",
+	"vấn đề đó", "vấn đề này", "ý đó", "ý trên", "bước đó", "bước này",
+	"ví dụ đó", "ví dụ trên", "loại đó", "loại này", "mô hình đó", "mô hình trên",
+	"tiếp theo", "còn về", "còn cái", "thế còn", "vậy còn", "còn gì",
+	// English
+	"it ", "they ", "them ", "that ", "this ", "those ", "these ",
+	"the above", "the previous", "mentioned above", "as above",
+}
 
 // RewriteQueryWithHistory sử dụng LLM để biến câu hỏi của user thành một query độc lập dựa trên lịch sử chat (SYS-023)
 func RewriteQueryWithHistory(userQuestion string, historySummary string) string {
 	if historySummary == "" {
+		return userQuestion
+	}
+
+	// Nếu query không chứa đại từ/từ chỉ định mơ hồ → đã tự đủ nghĩa, không cần LLM
+	lowerQ := strings.ToLower(strings.TrimSpace(userQuestion))
+	needsRewrite := false
+	for _, token := range ambiguousReferenceTokens {
+		if strings.Contains(lowerQ, token) {
+			needsRewrite = true
+			break
+		}
+	}
+	if !needsRewrite {
 		return userQuestion
 	}
 

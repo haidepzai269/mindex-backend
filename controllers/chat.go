@@ -18,6 +18,10 @@ import (
 
 const maxStoredChatMessages = 80
 
+// offTopicVectorSimThreshold: câu hỏi bị coi là off-topic nếu cosine similarity
+// tốt nhất thấp hơn ngưỡng này. Data thực tế: on-topic ~0.51, off-topic ~0.48.
+const offTopicVectorSimThreshold = 0.50
+
 type ChatRequest struct {
 	DocumentID    string `json:"document_id"`
 	CollectionID  string `json:"collection_id"`
@@ -235,6 +239,39 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		c.JSON(500, gin.H{"error": "Streaming unsupported"})
 		return
 	}
+	writeChatStatus(c, flusher, "thinking")
+	writeChatInsight(c, flusher, fmt.Sprintf("Đã nhận câu hỏi: \"%s\".", compactChatPreview(req.Question, 120)))
+
+	// [Phase C] Keyword pre-filter: bắt social messages rõ ràng trước mọi DB/Redis/API call
+	if isObviouslyOffTopic(req.Question) {
+		log.Printf("⚡ [CHAT] Keyword pre-filter: obvious off-topic for session=%s q=%q", req.SessionID, req.Question)
+		socialMsg := "Tôi chỉ hỗ trợ các câu hỏi liên quan đến nội dung tài liệu. Hãy thử hỏi về các khái niệm, định nghĩa hoặc thông tin được đề cập trong tài liệu bạn đang xem."
+		sendHardcodedSSEResponse(c, flusher, req.SessionID, socialMsg)
+		go saveHardcodedToHistory(req.SessionID, req.Question, socialMsg)
+		return
+	}
+
+	// [Cache Check] Kiểm tra answer cache trước mọi API call (chỉ cho non-thinking mode)
+	if !thinkingMode {
+		scopeID := req.DocumentID
+		if req.CollectionID != "" {
+			scopeID = req.CollectionID
+		}
+		cacheKey := utils.AnswerCacheKey(req.Question, scopeID, userPersona)
+		if cached, ok := utils.GetAnswerCache(context.Background(), cacheKey); ok {
+			log.Printf("🎯 [CHAT] Cache HIT session=%s scope=%s", req.SessionID, scopeID)
+			writeChatInsight(c, flusher, "Đã tìm thấy câu trả lời trong bộ nhớ đệm, trả về kết quả ngay lập tức.")
+			sendCachedSSEResponse(c, flusher, req.SessionID, cached)
+			go saveHardcodedToHistory(req.SessionID, req.Question, cached.Answer)
+			return
+		}
+	}
+
+	if req.CollectionID != "" {
+		writeChatInsight(c, flusher, "Đang đọc ngữ cảnh từ bộ tài liệu và lịch sử hội thoại gần nhất.")
+	} else {
+		writeChatInsight(c, flusher, "Đang đọc ngữ cảnh từ tài liệu đang mở và lịch sử hội thoại gần nhất.")
+	}
 
 	// 2. Lấy lịch sử từ Redis (Cơ chế Resilience - Nếu Redis lỗi vẫn chạy tiếp)
 	var historySummary string
@@ -244,7 +281,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 
-		rawHistory, err := config.RedisClient.LRange(ctx, historyKey, 0, -1).Result()
+		rawHistory, err := config.RedisClient.LRange(ctx, historyKey, -3, -1).Result()
 		if err == nil {
 			for _, item := range rawHistory {
 				var qa QAHistory
@@ -260,11 +297,42 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 	// Dynamic Branding: Chỉ chào trang trọng ở câu đầu tiên của phiên chat
 	isFirstMessage := (historySummary == "")
 	systemPrompt = utils.ApplyMindexBranding(systemPrompt, isFirstMessage)
+	if isFirstMessage {
+		writeChatInsight(c, flusher, "Đây là lượt hỏi đầu trong phiên, AI sẽ trả lời trực tiếp theo ngữ cảnh hiện có.")
+	} else {
+		writeChatInsight(c, flusher, "Đã tìm thấy lịch sử hội thoại, AI sẽ dùng nó để hiểu câu hỏi nối tiếp.")
+	}
+
+	// 3a. BM25 pre-check (SQL only, không cần API) — tin đầu tiên dùng query gốc
+	if isFirstMessage && !utils.QuickBM25Check(req.DocumentID, req.CollectionID, req.Question) {
+		log.Printf("⚡ [CHAT] BM25 pre-check: zero keyword match, skip embedding+rewrite for session=%s", req.SessionID)
+		offTopicMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
+		sendHardcodedSSEResponse(c, flusher, req.SessionID, offTopicMsg)
+		go saveHardcodedToHistory(req.SessionID, req.Question, offTopicMsg)
+		return
+	}
 
 	// 3. Query Rewrite (SYS-023) - Làm rõ câu hỏi dựa trên lịch sử trước khi search
 	searchQuery := utils.RewriteQueryWithHistory(req.Question, historySummary)
+	if strings.TrimSpace(searchQuery) != "" && searchQuery != req.Question {
+		writeChatInsight(c, flusher, fmt.Sprintf("Đã diễn giải lại câu hỏi để tìm kiếm chính xác hơn: \"%s\".", compactChatPreview(searchQuery, 140)))
+	}
+
+	// 3b. BM25 post-rewrite check cho follow-up messages — tiết kiệm Gemini embedding call
+	// nếu query đã rewrite vẫn không match keyword nào trong tài liệu.
+	if !isFirstMessage && !utils.QuickBM25Check(req.DocumentID, req.CollectionID, searchQuery) {
+		hasWebTrigger := config.Env.WebSearchEnabled && utils.WebSearchHeuristicTriggered(req.Question, searchQuery)
+		if !hasWebTrigger {
+			log.Printf("⚡ [CHAT] BM25 post-rewrite: zero keyword match for follow-up, skip embedding session=%s", req.SessionID)
+			offTopicMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
+			sendHardcodedSSEResponse(c, flusher, req.SessionID, offTopicMsg)
+			go saveHardcodedToHistory(req.SessionID, req.Question, offTopicMsg)
+			return
+		}
+	}
 
 	// 4. Vector Embed câu hỏi
+	writeChatInsight(c, flusher, "Đang tạo embedding để tìm các đoạn tài liệu liên quan.")
 	queryVec, err := utils.GeminiEmbedPool.EmbedWithRetry(searchQuery, utils.CallGeminiAPI)
 	if err != nil {
 		fmt.Fprintf(c.Writer, "event: error\ndata: {\"error\": \"EMBEDDING_FAILED\"}\n\n")
@@ -274,15 +342,34 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 
 	// 5. Hybrid Search (Vector + BM25)
 	log.Printf("🔍 [CHAT] Performing Hybrid Search for session: %s (Query: %s)", req.SessionID, searchQuery)
-	searchResults, _ := utils.HybridSearch(req.DocumentID, req.CollectionID, searchQuery, queryVec, 8)
+	searchResults, maxVectorSim, _ := utils.HybridSearch(req.DocumentID, req.CollectionID, searchQuery, queryVec, 8)
+	log.Printf("🎯 [CHAT] Hybrid Search done: results=%d, maxVectorSim=%.4f, session=%s", len(searchResults), maxVectorSim, req.SessionID)
+	writeChatInsight(c, flusher, fmt.Sprintf("Hybrid search tìm thấy %d đoạn ứng viên trong tài liệu.", len(searchResults)))
+
+	// Short-circuit: off-topic theo similarity threshold
+	// Ngoại lệ: nếu câu hỏi có heuristic web trigger (giá, luật, thời sự...)
+	// → vẫn cho tiếp tục để web search có cơ hội trả lời
+	isOffTopic := len(searchResults) == 0 || maxVectorSim < offTopicVectorSimThreshold
+	if isOffTopic {
+		hasWebTrigger := config.Env.WebSearchEnabled && utils.WebSearchHeuristicTriggered(req.Question, searchQuery)
+		if !hasWebTrigger {
+			log.Printf("⚡ [CHAT] Off-topic short-circuit: results=%d, maxSim=%.4f, threshold=%.2f, session=%s", len(searchResults), maxVectorSim, offTopicVectorSimThreshold, req.SessionID)
+			offTopicMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
+			sendHardcodedSSEResponse(c, flusher, req.SessionID, offTopicMsg)
+			go saveHardcodedToHistory(req.SessionID, req.Question, offTopicMsg)
+			return
+		}
+		log.Printf("🌐 [CHAT] Off-topic but web trigger detected, allowing web search: maxSim=%.4f session=%s", maxVectorSim, req.SessionID)
+		writeChatInsight(c, flusher, "Nội dung không có trong tài liệu, sẽ thử tìm kiếm web để bổ sung.")
+	}
 
 	var contextText string
 	var sources []map[string]interface{}
 	for _, res := range searchResults {
 		if req.CollectionID != "" {
-			contextText += fmt.Sprintf("📄 Tài liệu: %s\nĐoạn %d (Trang %d, Score: %.4f): %s\n\n", res.DocTitle, res.ChunkIndex, res.PageNumber, res.Score, res.RetrievalContent)
+			contextText += fmt.Sprintf("📄 Tài liệu: %s\nĐoạn %d (Trang %d): %s\n\n", res.DocTitle, res.ChunkIndex, res.PageNumber, res.RetrievalContent)
 		} else {
-			contextText += fmt.Sprintf("Đoạn %d (Trang %d, Score: %.4f): %s\n\n", res.ChunkIndex, res.PageNumber, res.Score, res.RetrievalContent)
+			contextText += fmt.Sprintf("Đoạn %d (Trang %d): %s\n\n", res.ChunkIndex, res.PageNumber, res.RetrievalContent)
 		}
 
 		sources = append(sources, map[string]interface{}{
@@ -299,10 +386,16 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 
 	// 5. Build prompt & Call AI
 	log.Printf("🤖 RAG: Context Length: %d chars", len(contextText))
+	if strings.TrimSpace(contextText) == "" {
+		writeChatInsight(c, flusher, "Không tìm thấy đoạn tài liệu đủ liên quan, AI sẽ dùng fallback theo persona.")
+	} else {
+		writeChatInsight(c, flusher, fmt.Sprintf("Đã gom %d nguồn trích dẫn vào ngữ cảnh trả lời.", len(sources)))
+	}
 
 	var webSearchMeta gin.H
 	if config.Env.WebSearchEnabled {
 		webPlan := utils.DecideWebSearch(req.Question, searchQuery, contextText, docIntelStr, userPersona, userTier, thinkingMode)
+		writeChatInsight(c, flusher, fmt.Sprintf("Quyết định web search: %s.", compactChatPreview(webPlan.Reason, 140)))
 		webSearchMeta = gin.H{
 			"requested": req.Thinking,
 			"thinking":  thinkingMode,
@@ -319,8 +412,10 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 				webSearchMeta["rate_limited"] = true
 				webSearchMeta["retry_after_seconds"] = int(retryAfter.Seconds())
 				webSearchMeta["error"] = "web search user rate limit reached"
+				writeChatInsight(c, flusher, "Web search bị giới hạn lượt dùng, AI tiếp tục với ngữ cảnh tài liệu hiện có.")
 			} else {
 				writeChatStatus(c, flusher, "searching")
+				writeChatInsight(c, flusher, fmt.Sprintf("Đang tìm web với truy vấn: \"%s\".", compactChatPreview(webPlan.Query, 140)))
 				webCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 				webResp, err := utils.SearchWeb(webCtx, webPlan)
 				cancel()
@@ -328,6 +423,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 				if err != nil {
 					log.Printf("⚠️ [CHAT] Web search skipped after decision: %v", err)
 					webSearchMeta["error"] = err.Error()
+					writeChatInsight(c, flusher, "Web search không khả dụng, AI tiếp tục dựa trên tài liệu và ngữ cảnh hiện có.")
 				} else {
 					webContext := utils.FormatWebSearchContext(webResp)
 					if webContext != "" {
@@ -339,11 +435,13 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 						webSearchMeta["from_cache"] = webResp.FromCache
 						webSearchMeta["results"] = len(webResp.Results)
 						log.Printf("🌐 [CHAT] Web search used provider=%s cache=%t results=%d", webResp.Provider, webResp.FromCache, len(webResp.Results))
+						writeChatInsight(c, flusher, fmt.Sprintf("Đã bổ sung %d kết quả web từ %s.", len(webResp.Results), webResp.Provider))
 					}
 				}
 			}
 		} else {
 			log.Printf("🌐 [CHAT] Web search decision=false reason=%s", webPlan.Reason)
+			writeChatInsight(c, flusher, "Không cần web search vì ngữ cảnh tài liệu đã đủ cho câu hỏi này.")
 		}
 	} else if req.Thinking {
 		webSearchMeta = gin.H{
@@ -352,6 +450,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 			"used":      false,
 			"reason":    "web search disabled",
 		}
+		writeChatInsight(c, flusher, "Web search đang tắt, AI sẽ trả lời trong phạm vi tài liệu và ngữ cảnh hiện có.")
 	}
 
 	if thinkingMode {
@@ -379,11 +478,22 @@ User đã bật chế độ Thinking cho câu hỏi này. Hãy phân tích kỹ 
 
 	// 6. Gửi sang AI Orchestrator (Tự động quản lý NineRouter -> Groq -> Cerebras -> Mistral -> OpenRouter)
 	log.Printf("🚀 [CHAT] Đang gửi yêu cầu tới AI Orchestrator cho session: %s", req.SessionID)
+	writeChatInsight(c, flusher, "Đang gửi prompt đã dựng sang AI Orchestrator để bắt đầu sinh câu trả lời.")
 	chatStart := time.Now()
 
 	fullAnswer, usedProvider, streamErr := utils.AI.ChatStream(utils.ServiceChat, c, messages, req.Model)
 
 	chatLatency := int(time.Since(chatStart).Milliseconds())
+
+	// [Cache Write] Lưu câu trả lời vào cache sau khi AI thành công (async, không block SSE)
+	if !thinkingMode && streamErr == nil && fullAnswer != "" {
+		scopeID := req.DocumentID
+		if req.CollectionID != "" {
+			scopeID = req.CollectionID
+		}
+		cacheKey := utils.AnswerCacheKey(req.Question, scopeID, userPersona)
+		go utils.SetAnswerCache(context.Background(), cacheKey, fullAnswer, sources, utils.AnswerCacheTTLDoc)
+	}
 
 	// Ghi AI Response Log:
 	// Tạo logID ngay (ko async) để event done có thể gửi log_id về FE,
@@ -438,12 +548,14 @@ User đã bật chế độ Thinking cho câu hỏi này. Hãy phân tích kỹ 
 		flusher.Flush()
 		return
 	}
+	writeChatInsight(c, flusher, fmt.Sprintf("Hoàn tất sinh câu trả lời bằng provider %s trong %.1fs.", usedProvider, float64(chatLatency)/1000))
 
 	// 7. Kết thúc file event done
 	donePayload := gin.H{
 		"session_id": req.SessionID,
 		"message_id": uuid.New().String(),
 		"log_id":     logID, // Dùng cho thumbs up/down UI
+		"answer":     fullAnswer,
 		"sources":    sources,
 		"web_search": webSearchMeta,
 	}
@@ -472,6 +584,7 @@ User đã bật chế độ Thinking cho câu hỏi này. Hãy phân tích kỹ 
 					"content":   fullAnswer,
 					"sources":   sources,
 					"timestamp": time.Now().Format(time.RFC3339),
+					"log_id":    logID,
 				}
 				asstMsgBytes, _ := json.Marshal(assistantMsg)
 				err := appendChatHistoryMessage(context.Background(), req.SessionID, string(asstMsgBytes))
@@ -542,6 +655,26 @@ func writeChatStatus(c *gin.Context, flusher http.Flusher, status string) {
 	flusher.Flush()
 }
 
+func writeChatInsight(c *gin.Context, flusher http.Flusher, text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+
+	payload, _ := json.Marshal(gin.H{"text": text})
+	fmt.Fprintf(c.Writer, "event: insight\ndata: %s\n\n", string(payload))
+	flusher.Flush()
+}
+
+func compactChatPreview(text string, limit int) string {
+	preview := strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	runes := []rune(preview)
+	if limit > 0 && len(runes) > limit {
+		return string(runes[:limit]) + "..."
+	}
+	return preview
+}
+
 func getUserTierForChat(userID string, role string) string {
 	if role == "admin" {
 		return "ADMIN"
@@ -557,6 +690,116 @@ func getUserTierForChat(userID string, role string) string {
 func isTierAllowedThinking(tier string) bool {
 	tier = strings.ToUpper(strings.TrimSpace(tier))
 	return tier == "PRO" || tier == "ULTRA" || tier == "ADMIN"
+}
+
+func sendHardcodedSSEResponse(c *gin.Context, flusher http.Flusher, sessionID, msg string) {
+	writeChatInsight(c, flusher, "Không tìm thấy nội dung liên quan, trả lời theo quy tắc hệ thống.")
+	words := strings.Fields(msg)
+	for i, w := range words {
+		token := w
+		if i < len(words)-1 {
+			token += " "
+		}
+		tokenPayload, _ := json.Marshal(map[string]string{"token": token})
+		fmt.Fprintf(c.Writer, "event: token\ndata: %s\n\n", string(tokenPayload))
+		flusher.Flush()
+	}
+	donePayload, _ := json.Marshal(gin.H{
+		"session_id": sessionID,
+		"message_id": uuid.New().String(),
+		"answer":     msg,
+		"sources":    []interface{}{},
+	})
+	fmt.Fprintf(c.Writer, "event: done\ndata: %s\n\n", string(donePayload))
+	flusher.Flush()
+}
+
+func sendCachedSSEResponse(c *gin.Context, flusher http.Flusher, sessionID string, cached *utils.CachedAnswer) {
+	words := strings.Fields(cached.Answer)
+	for i, w := range words {
+		token := w
+		if i < len(words)-1 {
+			token += " "
+		}
+		tokenPayload, _ := json.Marshal(map[string]string{"token": token})
+		fmt.Fprintf(c.Writer, "event: token\ndata: %s\n\n", string(tokenPayload))
+		flusher.Flush()
+	}
+	donePayload, _ := json.Marshal(gin.H{
+		"session_id": sessionID,
+		"message_id": uuid.New().String(),
+		"answer":     cached.Answer,
+		"sources":    cached.Sources,
+		"from_cache": true,
+	})
+	fmt.Fprintf(c.Writer, "event: done\ndata: %s\n\n", string(donePayload))
+	flusher.Flush()
+}
+
+func saveHardcodedToHistory(sessionID, question, answer string) {
+	asstMsg := gin.H{
+		"id":        uuid.New().String(),
+		"role":      "assistant",
+		"content":   answer,
+		"sources":   []interface{}{},
+		"timestamp": time.Now().Format(time.RFC3339),
+	}
+	asstMsgBytes, _ := json.Marshal(asstMsg)
+	if err := appendChatHistoryMessage(context.Background(), sessionID, string(asstMsgBytes)); err != nil {
+		log.Printf("❌ [DB Error] Failed to save hardcoded response: %v", err)
+	}
+	if config.RedisClient != nil {
+		historyKey := "session:" + sessionID
+		qa := QAHistory{Question: question, Answer: answer}
+		qaBytes, _ := json.Marshal(qa)
+		config.RedisClient.RPush(context.Background(), historyKey, string(qaBytes))
+		config.RedisClient.LTrim(context.Background(), historyKey, -10, -1)
+		config.RedisClient.Expire(context.Background(), historyKey, 1*time.Hour)
+	}
+}
+
+// isObviouslyOffTopic phát hiện nhanh các tin nhắn xã giao rõ ràng không phải câu hỏi
+// về tài liệu. Chỉ dùng string operations — zero DB/Redis/API call.
+// Nguyên tắc: chỉ bắt những gì 100% CHẮC CHẮN off-topic trong mọi ngữ cảnh tài liệu.
+func isObviouslyOffTopic(question string) bool {
+	q := utils.RemoveVietnameseSigns(strings.TrimSpace(question))
+
+	// Bỏ dấu câu cuối để "ok." == "ok"
+	q = strings.TrimRight(q, ".!?,;:")
+	q = strings.Join(strings.Fields(q), " ")
+
+	exactBlocks := []string{
+		// Chào hỏi
+		"hi", "hey", "hello", "xin chao", "chao",
+		// Cảm ơn / phản hồi ngắn
+		"cam on", "cam on ban", "cam on nhe", "thanks", "thank you", "thank u",
+		// Đồng ý / thừa nhận
+		"ok", "oke", "okie", "okay", "duoc", "duoc roi", "on roi",
+		"vang", "vang a", "vang ah", "da", "da a", "roi", "nhe",
+		// Biểu cảm rỗng
+		"hm", "hmm", "uh", "uh huh", "ah", "oh", "a",
+	}
+	for _, exact := range exactBlocks {
+		if q == exact {
+			return true
+		}
+	}
+
+	prefixBlocks := []string{
+		// Chào kiểu "xin chào bạn", "chào buổi sáng"
+		"xin chao ", "chao ban", "chao buoi",
+		// Câu hỏi về danh tính AI
+		"ban la ai", "ban ten gi", "may la ai", "mi la ai",
+		"ai day", "may la gi", "bot la gi", "ai la ban",
+		// Lời tạm biệt
+		"tam biet", "bye", "goodbye",
+	}
+	for _, prefix := range prefixBlocks {
+		if strings.HasPrefix(q, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildWebSearchPromptRules(userPersona string, thinkingMode bool) string {

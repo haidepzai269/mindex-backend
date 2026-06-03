@@ -79,7 +79,15 @@ type webSearchProviderConfig struct {
 
 func DecideWebSearch(question, searchQuery, contextText, docIntel, personaName, tier string, thinking bool) WebSearchPlan {
 	heuristic := heuristicWebSearchPlan(question, searchQuery, contextText, docIntel, personaName, tier, thinking)
-	if AI == nil {
+
+	// Nếu heuristic đã confident true → return ngay, không cần LLM
+	if heuristic.UseWebSearch {
+		return heuristic
+	}
+
+	// Chỉ gọi LLM cho "gray zone": thinking mode + paid tier
+	// (user yêu cầu phân tích sâu, heuristic không bắt được intent)
+	if AI == nil || !thinking || !isPaidTier(tier) {
 		return heuristic
 	}
 
@@ -140,6 +148,14 @@ Thinking: %t
 		plan.Reason = "Sensitive persona: query is not clearly related to the provided document context"
 	}
 	return plan
+}
+
+// WebSearchHeuristicTriggered kiểm tra nhanh xem câu hỏi có trigger web search không
+// dựa chỉ trên keyword (không cần context/docIntel). Dùng để quyết định có skip
+// off-topic short-circuit không khi maxVectorSim thấp.
+func WebSearchHeuristicTriggered(question, searchQuery string) bool {
+	plan := heuristicWebSearchPlan(question, searchQuery, "", "", "", "", false)
+	return plan.UseWebSearch
 }
 
 func SearchWeb(ctx context.Context, plan WebSearchPlan) (*WebSearchResponse, error) {

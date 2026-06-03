@@ -227,26 +227,37 @@ func SearchCommunity(c *gin.Context) {
 			queryVectorStr = cachedVector
 			searchMode = "hybrid"
 		} else {
-			// 1.1 Tối ưu hóa query bằng AI Orchestrator (Tự động mở rộng từ khóa tìm kiếm)
-			searchSystemPrompt := `Bạn là chuyên gia tối ưu hóa câu lệnh tìm kiếm học thuật. 
+			// Embed query trực tiếp cho query đủ dài (≥ 3 từ) — Gemini đã hiểu semantic tốt.
+			// Chỉ gọi AI expansion cho query ngắn (< 3 từ) hoặc acronym (toàn chữ hoa, < 10 ký tự)
+			// vì đó là các trường hợp embedding model cần thêm ngữ cảnh để hiểu đúng intent.
+			queryToEmbed := query
+			words := strings.Fields(strings.TrimSpace(query))
+			isShortQuery := len(words) < 3
+			isAcronym := len(strings.TrimSpace(query)) < 10 && strings.ToUpper(query) == query && len(words) == 1
+
+			if (isShortQuery || isAcronym) && utils.AI != nil {
+				searchSystemPrompt := `Bạn là chuyên gia tối ưu hóa câu lệnh tìm kiếm học thuật.
 Nhiệm vụ của bạn là mở rộng từ khóa tìm kiếm của người dùng thành một danh sách các thuật ngữ chuyên môn liên quan.
 CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. TUYỆT ĐỐI KHÔNG chào hỏi hay giải thích.`
 
-			searchMessages := []utils.ChatMessage{
-				{Role: "system", Content: searchSystemPrompt},
-				{Role: "user", Content: fmt.Sprintf("Mở rộng từ khóa tìm kiếm sau đây cho mục đích học thuật: %s", query)},
-			}
-			optimizedQuery, usedProvider, err := utils.AI.ChatNonStream(utils.ServiceSearch, searchMessages)
-			if err == nil {
-				log.Printf("💡 [Community] Optimized Search Query (via %s): '%s' -> '%s'", usedProvider, query, optimizedQuery)
-				// 1.2 Nhúng vector bằng Gemini (Matching Vector Space)
-				vec, err := utils.GeminiEmbedPool.EmbedWithRetry(optimizedQuery, utils.CallGeminiAPI)
-				if err == nil {
-					queryVectorStr = utils.FloatSliceToVectorString(vec)
-					searchMode = "hybrid"
-					// Lưu vào cache vector (12 giờ)
-					utils.SetCache(vectorCacheKey, queryVectorStr, 12*time.Hour)
+				searchMessages := []utils.ChatMessage{
+					{Role: "system", Content: searchSystemPrompt},
+					{Role: "user", Content: fmt.Sprintf("Mở rộng từ khóa tìm kiếm sau đây cho mục đích học thuật: %s", query)},
 				}
+				optimizedQuery, usedProvider, err := utils.AI.ChatNonStream(utils.ServiceSearch, searchMessages)
+				if err == nil && strings.TrimSpace(optimizedQuery) != "" {
+					log.Printf("💡 [Community] AI expanded short query (via %s): '%s' -> '%s'", usedProvider, query, optimizedQuery)
+					queryToEmbed = optimizedQuery
+				}
+			} else {
+				log.Printf("⚡ [Community] Embedding query directly (no AI expansion needed): '%s'", query)
+			}
+
+			vec, err := utils.GeminiEmbedPool.EmbedWithRetry(queryToEmbed, utils.CallGeminiAPI)
+			if err == nil {
+				queryVectorStr = utils.FloatSliceToVectorString(vec)
+				searchMode = "hybrid"
+				utils.SetCache(vectorCacheKey, queryVectorStr, 12*time.Hour)
 			}
 		}
 	} else if query != "" && exactMatchesFound >= 1 {
@@ -266,10 +277,13 @@ CHỈ trả về các từ khóa mở rộng, phân cách bằng dấu phẩy. T
 		// - Ưu tiên các tài liệu được dùng nhiều (query_count) và được vote nhiều
 		sqlQuery = `
 			WITH semantic_search AS (
-				SELECT document_id, MAX(1 - (embedding <=> $1::vector)) as max_similarity
-				FROM document_chunks
-				GROUP BY document_id
-				HAVING MAX(1 - (embedding <=> $1::vector)) > 0.48
+				SELECT c.document_id, MAX(1 - (c.embedding <=> $1::vector)) as max_similarity
+				FROM document_chunks c
+				JOIN documents d ON c.document_id = d.id
+				WHERE d.is_public = TRUE AND d.status = 'ready'
+				  AND (d.expired_at IS NULL OR d.expired_at > NOW())
+				GROUP BY c.document_id
+				HAVING MAX(1 - (c.embedding <=> $1::vector)) > 0.48
 			),
 			scoring AS (
 				SELECT 
