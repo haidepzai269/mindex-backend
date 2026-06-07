@@ -10,6 +10,7 @@ import (
 	"mindex-backend/utils"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -362,6 +363,20 @@ func handleRoomAI(roomID, callerUserID, query string) {
 	})
 
 	ragContext := buildGroupRoomContext(roomID, query)
+
+	// Short-circuit: không có tài liệu hoặc không tìm thấy nội dung liên quan → bỏ qua AI call
+	if ragContext == "" || ragContext == "Chưa có tài liệu nào trong phòng." || ragContext == "Không tìm thấy nội dung liên quan trong tài liệu của phòng." {
+		log.Printf("⚡ [RoomAI] No relevant context for room=%s, short-circuiting AI call (ragContext=%q)", roomID, ragContext)
+		var noContextMsg string
+		if ragContext == "" || ragContext == "Chưa có tài liệu nào trong phòng." {
+			noContextMsg = "Phòng chưa có tài liệu nào. Hãy thêm tài liệu vào phòng để MindexAI có thể hỗ trợ học tập!"
+		} else {
+			noContextMsg = "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu của phòng. Hãy thử hỏi về nội dung được đề cập trong các tài liệu."
+		}
+		broadcastRoomAIHardcoded(roomID, noContextMsg)
+		return
+	}
+
 	chatHistory := getRoomChatHistory(roomID, 10)
 	log.Printf("🧠 [RoomAI] room=%s context_len=%d history_len=%d", roomID, len(ragContext), len(chatHistory))
 
@@ -456,6 +471,133 @@ func getRoomChatHistory(roomID string, n int) string {
 		}
 	}
 	return sb.String()
+}
+
+func broadcastRoomAIHardcoded(roomID, msg string) {
+	words := strings.Fields(msg)
+	for i, w := range words {
+		chunk := w
+		if i < len(words)-1 {
+			chunk += " "
+		}
+		ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{
+			Type: "ai_chunk", RoomID: roomID,
+			Payload: gin.H{"chunk": chunk},
+		})
+	}
+	ws.RoomHubInstance.BroadcastToRoom(roomID, models.RoomEvent{
+		Type: "ai_done", RoomID: roomID,
+		Payload: gin.H{"full_text": msg, "source_info": ""},
+	})
+}
+
+// GetRoomHistory trả về lịch sử chat cũ hơn theo cursor-based pagination.
+// GET /rooms/:id/history?before={unix_ms}&limit=30
+// before: unix timestamp milliseconds của tin nhắn cũ nhất đang hiển thị (0 = lấy mới nhất)
+// limit: số tin cần lấy (mặc định 30, tối đa 100)
+func GetRoomHistory(c *gin.Context) {
+	roomID := c.Param("id")
+	userID := c.GetString("user_id")
+
+	// Kiểm tra user có trong phòng không
+	var isMember bool
+	config.DB.QueryRow(config.Ctx, `
+		SELECT EXISTS(SELECT 1 FROM group_room_members WHERE room_id = $1 AND user_id = $2 AND left_at IS NULL)`,
+		roomID, userID).Scan(&isMember)
+	if !isMember {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "error": "NOT_MEMBER"})
+		return
+	}
+
+	limitStr := c.DefaultQuery("limit", "30")
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 100 {
+		limit = 30
+	}
+
+	beforeStr := c.Query("before") // unix ms
+	var rows interface{}
+	var err error
+
+	type rowMsg struct {
+		ID        string    `json:"id"`
+		RoomID    string    `json:"room_id"`
+		UserID    *string   `json:"user_id"`
+		UserName  string    `json:"user_name"`
+		Text      string    `json:"text"`
+		ReplyToID *string   `json:"reply_to_id"`
+		MentionsAI bool     `json:"mentions_ai"`
+		IsAI      bool      `json:"is_ai"`
+		Timestamp time.Time `json:"timestamp"`
+	}
+	_ = rows
+	_ = err
+
+	var dbRows interface{ Next() bool; Close() }
+	var queryErr error
+
+	if beforeStr != "" && beforeStr != "0" {
+		beforeMs, _ := strconv.ParseInt(beforeStr, 10, 64)
+		beforeTime := time.UnixMilli(beforeMs).UTC()
+		dbRows, queryErr = config.DB.Query(config.Ctx, `
+			SELECT id, room_id, user_id, user_name, text, reply_to_id, mentions_ai, is_ai, timestamp
+			FROM room_messages
+			WHERE room_id = $1 AND timestamp < $2
+			ORDER BY timestamp DESC LIMIT $3`,
+			roomID, beforeTime, limit)
+	} else {
+		dbRows, queryErr = config.DB.Query(config.Ctx, `
+			SELECT id, room_id, user_id, user_name, text, reply_to_id, mentions_ai, is_ai, timestamp
+			FROM room_messages
+			WHERE room_id = $1
+			ORDER BY timestamp DESC LIMIT $2`,
+			roomID, limit)
+	}
+
+	if queryErr != nil {
+		log.Printf("❌ [GetRoomHistory] room=%s err=%v", roomID, queryErr)
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false})
+		return
+	}
+	defer dbRows.Close()
+
+	// Dùng pgx rows directly
+	pgxRows := dbRows.(interface {
+		Next() bool
+		Close()
+		Scan(...interface{}) error
+	})
+
+	var msgs []models.RoomChatMessage
+	for pgxRows.Next() {
+		var m models.RoomChatMessage
+		var uid *string
+		var replyTo *string
+		if err := pgxRows.Scan(&m.ID, &m.RoomID, &uid, &m.UserName, &m.Text, &replyTo, &m.MentionsAI, &m.IsAI, &m.Timestamp); err != nil {
+			log.Printf("⚠️ [GetRoomHistory] scan err: %v", err)
+			continue
+		}
+		if replyTo != nil {
+			m.ReplyToID = *replyTo
+		}
+		msgs = append(msgs, m)
+	}
+
+	// Đảo ngược để trả về thứ tự tăng dần (cũ → mới)
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+
+	hasMore := len(msgs) == limit
+
+	if msgs == nil {
+		msgs = []models.RoomChatMessage{}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"success":  true,
+		"messages": msgs,
+		"has_more": hasMore,
+	})
 }
 
 // buildGroupRoomContext lấy toàn bộ chunks từ tài liệu trong phòng

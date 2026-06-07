@@ -39,7 +39,7 @@ func RunSweeperNow() (map[string]interface{}, error) {
 
 	// 1. Lấy danh sách các tài liệu sắp bị xóa để gửi thông báo
 	rows, err := config.DB.Query(config.Ctx, `
-		SELECT d.id, dr.user_id, d.title, d.is_public
+		SELECT d.id, dr.user_id, d.title, d.is_public, d.cloudinary_public_id
 		FROM documents d
 		JOIN document_references dr ON dr.document_id = d.id
 		WHERE d.expired_at IS NOT NULL AND d.expired_at < NOW()`)
@@ -49,6 +49,7 @@ func RunSweeperNow() (map[string]interface{}, error) {
 		UserID   string
 		Title    string
 		IsPublic bool
+		PublicID *string
 	}
 	var toDelete []delDoc
 	shouldClearCommunity := false
@@ -57,7 +58,7 @@ func RunSweeperNow() (map[string]interface{}, error) {
 		defer rows.Close()
 		for rows.Next() {
 			var d delDoc
-			if err := rows.Scan(&d.ID, &d.UserID, &d.Title, &d.IsPublic); err == nil {
+			if err := rows.Scan(&d.ID, &d.UserID, &d.Title, &d.IsPublic, &d.PublicID); err == nil {
 				toDelete = append(toDelete, d)
 				if d.IsPublic {
 					shouldClearCommunity = true
@@ -99,6 +100,11 @@ func RunSweeperNow() (map[string]interface{}, error) {
 				fmt.Sprintf("Tài liệu \"%s\" đã được dọn dẹp hệ thống sau khi hết hạn.", d.Title),
 				map[string]string{"doc_id": d.ID},
 			)
+			if d.PublicID != nil && *d.PublicID != "" {
+				if err := utils.DestroyRawFromCloudinary(*d.PublicID); err != nil {
+					log.Printf("[Sweeper] Cloudinary cleanup failed for %s: %v", d.ID, err)
+				}
+			}
 		}
 
 		if shouldClearCommunity {

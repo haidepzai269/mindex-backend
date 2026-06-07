@@ -243,6 +243,14 @@ func GlobalAIMessage(c *gin.Context) {
 	writeChatInsight(c, flusher, fmt.Sprintf("Đã nhận câu hỏi Global AI: \"%s\".", compactChatPreview(req.Question, 120)))
 
 	// [Phase C] Keyword pre-filter cho social messages rõ ràng
+	if utils.IsSensitiveContent(req.Question) {
+		log.Printf("⚡ [GLOBAL_AI] Keyword pre-filter: sensitive content detected for session=%s q=%q", req.SessionID, req.Question)
+		sensitiveMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
+		sendHardcodedSSEResponse(c, flusher, req.SessionID, sensitiveMsg)
+		go saveHardcodedToHistory(req.SessionID, req.Question, sensitiveMsg)
+		return
+	}
+
 	if isObviouslyOffTopic(req.Question) {
 		log.Printf("⚡ [GLOBAL_AI] Keyword pre-filter: obvious off-topic for session=%s q=%q", req.SessionID, req.Question)
 		socialMsg := "Tôi là Mindex AI, chuyên hỗ trợ học tập dựa trên tài liệu trong Thư viện chung Mindex. Hãy hỏi tôi về các chủ đề học thuật, khái niệm hoặc nội dung tài liệu bạn muốn tìm hiểu!"

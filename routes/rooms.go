@@ -26,5 +26,8 @@ func RegisterRoomRoutes(rg *gin.RouterGroup) {
 
 		// WebSocket for group chat
 		rooms.GET("/:id/ws", controllers.ConnectRoomWS)
+
+		// REST: load thêm lịch sử chat cũ hơn (cursor-based)
+		rooms.GET("/:id/history", controllers.GetRoomHistory)
 	}
 }

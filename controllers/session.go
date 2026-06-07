@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"encoding/json"
+	"log"
 	"mindex-backend/config"
 
 	"github.com/gin-gonic/gin"
@@ -78,7 +79,11 @@ func CreateSession(c *gin.Context) {
 	})
 }
 
-// GetSessionMessages lấy lịch sử tin nhắn của một session
+// GetSessionMessages lấy lịch sử tin nhắn của một session.
+// Hỗ trợ pagination: ?limit=30&skip=0
+//   - limit: số tin cần lấy (mặc định 0 = toàn bộ, backward-compat)
+//   - skip: bỏ qua N tin từ cuối (dùng khi load thêm tin cũ hơn)
+// Response thêm: total (tổng số tin), has_more (còn tin cũ hơn không)
 func GetSessionMessages(c *gin.Context) {
 	sessionID := c.Param("session_id")
 	if sessionID == "" {
@@ -86,35 +91,131 @@ func GetSessionMessages(c *gin.Context) {
 		return
 	}
 
+	limit := parsePageInt(c.Query("limit"), 0, 0, 80)   // 0 = không paginate
+	skip := parsePageInt(c.Query("skip"), 0, 0, 10000)
+
 	var fullMessages []byte
 	err := config.DB.QueryRow(config.Ctx, `
-		SELECT full_messages FROM chat_histories 
+		SELECT full_messages FROM chat_histories
 		WHERE session_id = $1`, sessionID).Scan(&fullMessages)
 
 	if err != nil {
-		// Trả về mảng rỗng thay vì 404 để frontend không bị lỗi
 		c.JSON(200, gin.H{
 			"success": true,
 			"data": gin.H{
 				"session_id": sessionID,
 				"messages":   []interface{}{},
+				"total":      0,
+				"has_more":   false,
 			},
 		})
 		return
 	}
 
-	var messages []interface{}
+	var allMessages []map[string]interface{}
 	if len(fullMessages) > 0 {
-		json.Unmarshal(fullMessages, &messages)
+		json.Unmarshal(fullMessages, &allMessages)
+	}
+
+	// Hydrate log_id cho tất cả messages trước khi paginate
+	userID := c.GetString("user_id")
+	allMessages = hydrateLogIDs(allMessages, sessionID, userID)
+
+	total := len(allMessages)
+	var paged []map[string]interface{}
+	hasMore := false
+
+	if limit > 0 {
+		// Lấy [total-limit-skip : total-skip] (tin gần nhất)
+		end := total - skip
+		if end < 0 {
+			end = 0
+		}
+		start := end - limit
+		if start < 0 {
+			start = 0
+		}
+		paged = allMessages[start:end]
+		hasMore = start > 0
+	} else {
+		// Không paginate: trả tất cả (backward-compat)
+		paged = allMessages
+		hasMore = false
 	}
 
 	c.JSON(200, gin.H{
 		"success": true,
 		"data": gin.H{
 			"session_id": sessionID,
-			"messages":   messages,
+			"messages":   paged,
+			"total":      total,
+			"has_more":   hasMore,
 		},
 	})
+}
+
+// hydrateLogIDs đảm bảo mỗi assistant message có log_id, ghi lại DB nếu thiếu.
+func hydrateLogIDs(messages []map[string]interface{}, sessionID, userID string) []map[string]interface{} {
+	changed := false
+	for i, msg := range messages {
+		role, ok := msg["role"].(string)
+		if !ok || role != "assistant" {
+			continue
+		}
+		if _, has := msg["log_id"]; has {
+			continue
+		}
+		content, _ := msg["content"].(string)
+		var logID string
+		err := config.DB.QueryRow(config.Ctx, `
+			SELECT id FROM ai_response_logs
+			WHERE session_id = $1 AND answer = $2 LIMIT 1`, sessionID, content).Scan(&logID)
+		if err != nil {
+			logID = uuid.New().String()
+			_, insertErr := config.DB.Exec(config.Ctx, `
+				INSERT INTO ai_response_logs
+				  (id, session_id, user_id, question, answer, model_used, latency_ms, token_count, sources_count)
+				VALUES ($1, $2, $3, 'Lịch sử chat', $4, 'legacy', 0, 0, 0)`,
+				logID, sessionID, userID, content)
+			if insertErr != nil {
+				log.Printf("❌ [LegacyLog] Failed to insert legacy log: %v", insertErr)
+				continue
+			}
+		}
+		messages[i]["log_id"] = logID
+		changed = true
+	}
+	if changed {
+		if newBytes, err := json.Marshal(messages); err == nil {
+			_, updateErr := config.DB.Exec(config.Ctx, `
+				UPDATE chat_histories SET full_messages = $1 WHERE session_id = $2`, newBytes, sessionID)
+			if updateErr != nil {
+				log.Printf("❌ [LegacyLog] Failed to update chat history: %v", updateErr)
+			}
+		}
+	}
+	return messages
+}
+
+// parsePageInt parse query param thành int với default và clamp.
+func parsePageInt(s string, def, min, max int) int {
+	if s == "" {
+		return def
+	}
+	v := 0
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return def
+		}
+		v = v*10 + int(ch-'0')
+	}
+	if v < min {
+		return min
+	}
+	if max > 0 && v > max {
+		return max
+	}
+	return v
 }
 
 // GetActiveSession tìm session gần nhất của user với tài liệu này

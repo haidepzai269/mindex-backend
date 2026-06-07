@@ -8,6 +8,7 @@ import (
 	"mindex-backend/config"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type ModerationResult struct {
@@ -18,71 +19,67 @@ type ModerationResult struct {
 }
 
 var (
-	spamURLRegex    = regexp.MustCompile(`(bit\.ly|t\.co|tinyurl\.com|cutt\.ly|shurte\.st|goo\.gl|ow\.ly|is\.gd|buff\.ly|bit\.do)`)
-	phoneRegex      = regexp.MustCompile(`(0|\+84)(\s|\.)?((3[2-9])|(5[689])|(7[06-9])|(8[1-689])|(9[0-46-9]))(\d)(\s|\.)?(\d{3})(\s|\.)?(\d{3})`)
+	spamURLRegex = regexp.MustCompile(`(bit\.ly|t\.co|tinyurl\.com|cutt\.ly|shurte\.st|goo\.gl|ow\.ly|is\.gd|buff\.ly|bit\.do)`)
+	phoneRegex   = regexp.MustCompile(`(0|\+84)(\s|\.)?((3[2-9])|(5[689])|(7[06-9])|(8[1-689])|(9[0-46-9]))(\d)(\s|\.)?(\d{3})(\s|\.)?(\d{3})`)
+
 	redFlagKeywords = []string{
-		"giá chỉ", "liên hệ ngay", "ưu đãi hôm nay", "mua ngay", "giá rẻ nhất",
-		"click here", "free download", "tải ngay", "trực tiếp bóng đá", "kèo nhà cái",
-		"xổ số", "soi cầu", "kiếm tiền online", "tuyển dụng gấp", "làm việc tại nhà",
-		"nhận quà", "trúng thưởng", "khuyến mãi cực lớn", "duy nhất hôm nay",
+		"gia chi", "lien he ngay", "uu dai hom nay", "mua ngay", "gia re nhat",
+		"click here", "free download", "tai ngay", "truc tiep bong da", "keo nha cai",
+		"xo so", "soi cau", "kiem tien online", "tuyen dung gap", "lam viec tai nha",
+		"nhan qua", "trung thuong", "khuyen mai cuc lon", "duy nhat hom nay",
 	}
 )
 
-// Tier 1: Rule-based checks
+// T1RuleBased performs deterministic moderation that must not fail open.
 func T1RuleBased(ctx context.Context, fileHash string, tokenCount int, charCount int, rawText string) (bool, string) {
-	// Check rejected hashes
 	var exists bool
 	err := config.DB.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM rejected_hashes WHERE file_hash = $1)", fileHash).Scan(&exists)
 	if err == nil && exists {
-		return false, "File đã bị từ chối trước đó (Blacklisted)"
+		return false, "File da bi tu choi truoc do"
 	}
 
 	if tokenCount < 50 {
-		return false, fmt.Sprintf("Tài liệu quá ít nội dung (Có %d tokens, yêu cầu tối thiểu 50)", tokenCount)
+		return false, fmt.Sprintf("Tai lieu qua it noi dung (co %d tokens, yeu cau toi thieu 50)", tokenCount)
 	}
 	if charCount < 200 {
-		return false, fmt.Sprintf("Tài liệu không đủ độ dài hoặc không đọc được (Có %d ký tự, yêu cầu tối thiểu 200)", charCount)
+		return false, fmt.Sprintf("Tai lieu khong du do dai hoac khong doc duoc (co %d ky tu, yeu cau toi thieu 200)", charCount)
 	}
 
-	if spamURLRegex.MatchString(rawText) {
-		return false, "Phát hiện link spam hoặc rút gọn trái phép"
+	if spamURLRegex.MatchString(strings.ToLower(rawText)) {
+		return false, "Phat hien link spam hoac rut gon trai phep"
 	}
 
-	// Đếm số lượng số điện thoại
-	phoneMatches := phoneRegex.FindAllString(rawText, -1)
-	if len(phoneMatches) > 3 {
-		return false, "Phát hiện quá nhiều số điện thoại (Nghi vấn quảng cáo)"
+	if matches := phoneRegex.FindAllString(rawText, -1); len(matches) > 3 {
+		return false, "Phat hien qua nhieu so dien thoai"
 	}
 
 	return true, ""
 }
 
-// Tier 2: Lightweight Keyword checks
+// T2KeywordCheck checks obvious spam language before spending AI quota.
 func T2KeywordCheck(rawText string) (bool, string) {
-	// Chỉ check 200 từ đầu tiên
 	words := strings.Fields(rawText)
 	limit := 200
 	if len(words) < limit {
 		limit = len(words)
 	}
-	first200Content := strings.ToLower(strings.Join(words[:limit], " "))
+	firstContent := strings.ToLower(strings.Join(words[:limit], " "))
 
 	foundCount := 0
 	for _, kw := range redFlagKeywords {
-		if strings.Contains(first200Content, strings.ToLower(kw)) {
+		if strings.Contains(firstContent, strings.ToLower(kw)) {
 			foundCount++
 		}
 		if foundCount >= 2 {
-			return false, fmt.Sprintf("Phát hiện từ khóa vi phạm: %s", kw)
+			return false, fmt.Sprintf("Phat hien tu khoa vi pham: %s", kw)
 		}
 	}
 
 	return true, ""
 }
 
-// Tier 3: AI Check via Groq
-func T3AICheck(rawText string) (bool, string, string) {
-	// Lấy 500 từ đầu tiên
+// T3AICheck returns an error for transient AI/parsing failures so upload jobs can retry.
+func T3AICheck(rawText string) (bool, string, string, error) {
 	words := strings.Fields(rawText)
 	limit := 500
 	if len(words) < limit {
@@ -90,7 +87,6 @@ func T3AICheck(rawText string) (bool, string, string) {
 	}
 	sampleText := strings.Join(words[:limit], " ")
 
-	// Làm sạch text để tránh lỗi JSON hoặc ký tự lạ khi gửi sang AI
 	cleanSample := regexp.MustCompile(`[\r\n\t]+`).ReplaceAllString(sampleText, " ")
 	cleanSample = regexp.MustCompile(`[^\p{L}\p{N}\p{P}\s]+`).ReplaceAllString(cleanSample, "")
 	runes := []rune(cleanSample)
@@ -98,27 +94,27 @@ func T3AICheck(rawText string) (bool, string, string) {
 		cleanSample = string(runes[:2000])
 	}
 
-	prompt := fmt.Sprintf(`Phân tích 500 từ đầu tiên của tài liệu này và trả về JSON duy nhất:
+	prompt := fmt.Sprintf(`Phan tich 500 tu dau tien cua tai lieu nay va tra ve JSON duy nhat:
 {
-  "is_academic": boolean, 
-  "quality_score": number (1-10), 
+  "is_academic": boolean,
+  "quality_score": number (1-10),
   "subject_area": string
 }
-Lưu ý:
-- Học thuật (is_academic = true) bao gồm: giáo trình, báo cáo khoa học, tiểu luận, hướng dẫn kỹ thuật.
-- Từ chối nếu là văn bản rác, quảng cáo, hoặc nội dung không mang tính giáo dục.
+Luu y:
+- Hoc thuat (is_academic = true) bao gom: giao trinh, bao cao khoa hoc, tieu luan, huong dan ky thuat.
+- Tu choi neu la van ban rac, quang cao, hoac noi dung khong mang tinh giao duc.
 
-Nội dung: %s`, cleanSample)
+Noi dung: %s`, cleanSample)
 
 	messages := []ChatMessage{
-		{Role: "system", Content: "Bạn là một AI chuyên phân loại tài liệu học thuật cho sinh viên HCMUS. Luôn trả về JSON."},
+		{Role: "system", Content: "Ban la mot AI chuyen phan loai tai lieu hoc thuat. Luon tra ve JSON."},
 		{Role: "user", Content: prompt},
 	}
 
 	response, _, err := AI.ChatNonStream(ServiceClassify, messages)
 	if err != nil {
-		log.Printf("Lỗi gọi AI Moderation: %v", err)
-		return true, "Lỗi AI, tạm thời cho qua", "Chưa phân loại" // Fail-safe: Nếu AI lỗi cho qua
+		log.Printf("AI moderation call failed: %v", err)
+		return false, "Loi AI moderation", "", err
 	}
 
 	var res struct {
@@ -129,35 +125,48 @@ Nội dung: %s`, cleanSample)
 
 	cleanJSON := CleanJSONString(response)
 	if err := json.Unmarshal([]byte(cleanJSON), &res); err != nil {
-		log.Printf("Lỗi Unmarshal AI Moderation: %v. Response: %s", err, response)
-		return true, "Lỗi format AI, tạm thời cho qua", "Chưa phân loại"
+		log.Printf("AI moderation JSON parse failed: %v. Response: %s", err, response)
+		return false, "Loi format AI moderation", "", err
 	}
 
 	if !res.IsAcademic {
-		return false, "Tài liệu không mang tính học thuật/chuyên môn", ""
+		return false, "Tai lieu khong mang tinh hoc thuat/chuyen mon", "", nil
 	}
 	if res.QualityScore < 4 {
-		return false, fmt.Sprintf("Chất lượng nội dung quá thấp (Score: %.1f)", res.QualityScore), ""
+		return false, fmt.Sprintf("Chat luong noi dung qua thap (Score: %.1f)", res.QualityScore), "", nil
 	}
 
-	return true, "", res.SubjectArea
+	return true, "", res.SubjectArea, nil
 }
 
-// SaveRejectedHash lưu hash vào DB để chặn sau này
 func SaveRejectedHash(ctx context.Context, hash string, reason string) {
 	_, err := config.DB.Exec(ctx, "INSERT INTO rejected_hashes (file_hash, reason) VALUES ($1, $2) ON CONFLICT DO NOTHING", hash, reason)
 	if err != nil {
-		log.Printf("Không thể lưu rejected hash: %v", err)
+		log.Printf("Could not save rejected hash: %v", err)
 	}
 }
 
-// UpdateDocProgress lưu trạng thái và phần trăm tiến độ vào Redis
 func UpdateDocProgress(docID string, status string, progress int) {
+	UpdateDocProgressDetail(docID, status, progress, "", "")
+}
+
+func UpdateDocProgressDetail(docID string, status string, progress int, message string, errorCode string) {
+	if config.RedisClient == nil {
+		return
+	}
+
 	key := fmt.Sprintf("doc_progress:%s", docID)
 	val := map[string]interface{}{
 		"status":   status,
 		"progress": progress,
 	}
+	if message != "" {
+		val["message"] = message
+	}
+	if errorCode != "" {
+		val["error_code"] = errorCode
+	}
+
 	data, _ := json.Marshal(val)
-	config.RedisClient.Set(config.Ctx, key, data, 0)
+	config.RedisClient.Set(config.Ctx, key, data, 24*time.Hour)
 }

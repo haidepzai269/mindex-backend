@@ -2,13 +2,16 @@ package workers
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"mindex-backend/config"
-	"mindex-backend/controllers"
+	"mindex-backend/models"
 	"mindex-backend/utils"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,92 +22,192 @@ const maxConcurrentEmbeds = 3
 
 var embedSemaphore = make(chan struct{}, maxConcurrentEmbeds)
 
-func RunEmbeddingPipeline(job controllers.UploadJob) error {
-	// 1. Đọc file từ Local Path (nơi Controller đã lưu tạm)
-	utils.UpdateDocProgress(job.DocID, "downloading", 10)
+type PipelineError struct {
+	Code      string
+	Message   string
+	Retryable bool
+	Rejected  bool
+	Err       error
+}
 
-	// Tự động dọn dẹp file tạm khi pipeline hoàn tất (thành công hoặc lỗi)
-	defer os.Remove(job.LocalPath)
-
-	fileBytes, err := os.ReadFile(job.LocalPath)
-	if err != nil {
-		utils.UpdateDocProgress(job.DocID, "error", 0)
-		return fmt.Errorf("không thể đọc file từ hệ thống: %v", err)
+func (e *PipelineError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %v", e.Message, e.Err)
 	}
-	log.Printf("📥 Read file from local path for Doc %s: %d bytes", job.DocID, len(fileBytes))
+	return e.Message
+}
 
-	// 2. Tính hash để đối chiếu (Controller đã lưu hash này, nhưng Worker vẫn dùng để log/audit)
+func (e *PipelineError) Unwrap() error {
+	return e.Err
+}
+
+func RunEmbeddingPipeline(job models.UploadJob) error {
+	utils.UpdateDocProgressDetail(job.DocID, "downloading", 10, "Dang doc file goc", "")
+
+	localPath, cleanup, err := ensurePipelineFile(job)
+	if cleanup {
+		defer os.Remove(localPath)
+	} else if localPath != "" {
+		defer os.Remove(localPath)
+	}
+	if err != nil {
+		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Khong the doc file goc", "SOURCE_FILE_UNAVAILABLE")
+		return &PipelineError{Code: "SOURCE_FILE_UNAVAILABLE", Message: "Khong the doc file goc", Retryable: true, Err: err}
+	}
+
+	fileBytes, err := os.ReadFile(localPath)
+	if err != nil {
+		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Khong the doc file tam", "SOURCE_FILE_READ_FAILED")
+		return &PipelineError{Code: "SOURCE_FILE_READ_FAILED", Message: "Khong the doc file tam", Retryable: true, Err: err}
+	}
 	hash := fmt.Sprintf("%x", sha256.Sum256(fileBytes))
+	log.Printf("[Upload Pipeline] Read file for doc %s: %d bytes", job.DocID, len(fileBytes))
 
-	// 3. Khởi tạo Extraction & Chunking (Structure-aware)
-	utils.UpdateDocProgress(job.DocID, "extracting", 30)
-	chunks, err := utils.ExtractAndChunk(job.LocalPath, utils.CleanTextLocal)
+	utils.UpdateDocProgressDetail(job.DocID, "extracting", 30, "Dang trich xuat noi dung", "")
+	chunks, err := utils.ExtractAndChunk(localPath, utils.CleanTextLocal)
 	if err != nil {
-		utils.UpdateDocProgress(job.DocID, "error", 0)
-		return fmt.Errorf("lỗi trích xuất và chunking: %v", err)
+		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Khong the trich xuat noi dung", "EXTRACTION_FAILED")
+		return &PipelineError{Code: "EXTRACTION_FAILED", Message: "Khong the trich xuat noi dung", Retryable: false, Err: err}
 	}
 
-	// Tái tạo cleanText để dùng cho Moderation và Classification
 	var cleanTextBuilder strings.Builder
 	for _, chunk := range chunks {
 		cleanTextBuilder.WriteString(chunk.Content + "\n\n")
 	}
 	cleanText := cleanTextBuilder.String()
-	log.Printf("📄 Extracted %d chunks from Doc %s", len(chunks), job.DocID)
+	log.Printf("[Upload Pipeline] Extracted %d chunks from doc %s", len(chunks), job.DocID)
 
-	// 3a. Document Intelligence (Nghiên cứu tài liệu toàn diện)
-	utils.UpdateDocProgress(job.DocID, "analyzing", 35)
+	utils.UpdateDocProgressDetail(job.DocID, "analyzing", 35, "Dang phan tich tong quan", "")
 	docIntel, intelErr := utils.AnalyzeDocument(job.DocID, cleanText)
 	if intelErr != nil {
-		log.Printf("⚠️ [Pipeline Warning] Doc Intelligence failed for %s: %v. Continuing without big picture metadata.", job.DocID, intelErr)
+		log.Printf("[Upload Pipeline] Document intelligence warning for %s: %v", job.DocID, intelErr)
 	}
 
-	// Kiểm duyệt
-	utils.UpdateDocProgress(job.DocID, "moderating", 40)
+	utils.UpdateDocProgressDetail(job.DocID, "moderating", 40, "Dang kiem duyet noi dung", "")
 	if passed, reason := utils.T1RuleBased(config.Ctx, hash, len(strings.Fields(cleanText)), len(cleanText), cleanText); !passed {
-		config.DB.Exec(config.Ctx, `UPDATE documents SET status='error' WHERE id=$1`, job.DocID)
-		return fmt.Errorf("kiểm duyệt Tầng 1 thất bại: %s", reason)
+		utils.SaveRejectedHash(config.Ctx, hash, reason)
+		return &PipelineError{Code: "MODERATION_T1_REJECTED", Message: reason, Retryable: false, Rejected: true}
 	}
 
-	passed, reason, subjectArea := utils.T3AICheck(cleanText)
+	if passed, reason := utils.T2KeywordCheck(cleanText); !passed {
+		utils.SaveRejectedHash(config.Ctx, hash, reason)
+		return &PipelineError{Code: "MODERATION_T2_REJECTED", Message: reason, Retryable: false, Rejected: true}
+	}
+
+	passed, reason, subjectArea, moderationErr := utils.T3AICheck(cleanText)
+	if moderationErr != nil {
+		return &PipelineError{Code: "MODERATION_AI_UNAVAILABLE", Message: reason, Retryable: true, Err: moderationErr}
+	}
 	if !passed {
-		config.DB.Exec(config.Ctx, `UPDATE documents SET status='error' WHERE id=$1`, job.DocID)
-		return fmt.Errorf("kiểm duyệt AI thất bại: %s", reason)
+		utils.SaveRejectedHash(config.Ctx, hash, reason)
+		return &PipelineError{Code: "MODERATION_AI_REJECTED", Message: reason, Retryable: false, Rejected: true}
 	}
-	log.Printf("✅ Moderation Passed. Subject: %s", subjectArea)
+	log.Printf("[Upload Pipeline] Moderation passed. Subject: %s", subjectArea)
 
-	// 3b. AI Classification (Lĩnh vực) - dùng AI Orchestrator (Ưu tiên Gemini -> Cerebras -> Groq -> HF)
-	utils.UpdateDocProgress(job.DocID, "classifying", 45)
+	utils.UpdateDocProgressDetail(job.DocID, "classifying", 45, "Dang phan loai tai lieu", "")
+	updateDetectedPersona(job.DocID, cleanText)
 
-	classifySystemPrompt := `Bạn là chuyên gia phân loại tài liệu. Nhiệm vụ của bạn là xác định đối tượng người dùng (Persona) phù hợp nhất với tài liệu này.
-Chỉ trả về MỘT từ hoặc cụm từ ngắn gọn duy nhất (ví dụ: Sinh viên, Lập trình viên, Luật sư, Bác sĩ, Giảng viên, Học sinh, Kỹ sư, v.v.).
-TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
+	utils.UpdateDocProgressDetail(job.DocID, "embedding", 60, "Dang tao embedding", "")
+	if err := embedChunks(job, chunks, docIntel); err != nil {
+		return err
+	}
+
+	utils.UpdateDocProgressDetail(job.DocID, "ready", 100, "Tai lieu da san sang", "")
+	_, _ = config.DB.Exec(config.Ctx, `
+		UPDATE documents
+		SET status='ready',
+			file_hash=$1,
+			processing_error_code=NULL,
+			processing_error_message=NULL
+		WHERE id=$2`,
+		hash, job.DocID)
+
+	utils.ClearCommunityCache()
+	_, _ = config.DB.Exec(config.Ctx, `
+		INSERT INTO document_references (user_id, document_id, is_owner, pinned)
+		VALUES ($1, $2, TRUE, FALSE)
+		ON CONFLICT DO NOTHING`,
+		job.UserID, job.DocID)
+
+	return nil
+}
+
+func ensurePipelineFile(job models.UploadJob) (string, bool, error) {
+	if job.LocalPath != "" {
+		if _, err := os.Stat(job.LocalPath); err == nil {
+			return job.LocalPath, false, nil
+		}
+	}
+
+	if job.CloudinaryURL == "" {
+		return "", false, errors.New("missing cloudinary url")
+	}
+
+	uploadDir := "./tmp/uploads"
+	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+		return "", false, err
+	}
+
+	ext := filepath.Ext(job.CloudinaryURL)
+	if ext == "" {
+		ext = ".bin"
+	}
+	localPath := filepath.Join(uploadDir, fmt.Sprintf("%s-retry%s", job.DocID, ext))
+	if err := downloadToFile(job.CloudinaryURL, localPath); err != nil {
+		_ = os.Remove(localPath)
+		return "", false, err
+	}
+	return localPath, true, nil
+}
+
+func downloadToFile(rawURL, dest string) error {
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("download returned %d", resp.StatusCode)
+	}
+
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
+func updateDetectedPersona(docID, cleanText string) {
+	classifySystemPrompt := `Ban la chuyen gia phan loai tai lieu. Tra ve mot tu hoac cum tu ngan gon duy nhat cho persona phu hop.`
 
 	classifyMessages := []utils.ChatMessage{
 		{Role: "system", Content: classifySystemPrompt},
-		{Role: "user", Content: fmt.Sprintf("Hãy phân loại tài liệu sau đây thành một Persona duy nhất:\n\n%s", func() string {
-			runes := []rune(cleanText)
-			if len(runes) > 2000 {
-				return string(runes[:2000])
-			}
-			return cleanText
-		}())},
+		{Role: "user", Content: fmt.Sprintf("Hay phan loai tai lieu sau thanh mot persona duy nhat:\n\n%s", firstRunes(cleanText, 2000))},
 	}
 
 	detectedPersona, usedProvider, err := utils.AI.ChatNonStream(utils.ServiceClassify, classifyMessages)
 	if err != nil {
-		log.Printf("⚠️ [Pipeline Error] AI Classification failed for Doc %s: %v. Keeping default persona.", job.DocID, err)
-	} else if detectedPersona != "" {
-		log.Printf("🏷️ [Pipeline Success] AI detected persona (via %s): %s for Doc %s", usedProvider, detectedPersona, job.DocID)
-		_, _ = config.DB.Exec(config.Ctx, `UPDATE documents SET creator_persona=$1 WHERE id=$2`, detectedPersona, job.DocID)
+		log.Printf("[Upload Pipeline] AI classification failed for doc %s: %v", docID, err)
+		return
 	}
+	if detectedPersona != "" {
+		log.Printf("[Upload Pipeline] AI detected persona via %s: %s for doc %s", usedProvider, detectedPersona, docID)
+		_, _ = config.DB.Exec(config.Ctx, `UPDATE documents SET creator_persona=$1 WHERE id=$2`, detectedPersona, docID)
+	}
+}
 
-	// Embedding
-	utils.UpdateDocProgress(job.DocID, "embedding", 60)
-	// utils.ExtractAndChunk đã chia chunks ở bước trên
+func firstRunes(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) > limit {
+		return string(runes[:limit])
+	}
+	return value
+}
 
-	log.Printf("🧩 Doc %s: Using %d structured chunks. Starting embedding...", job.DocID, len(chunks))
-
+func embedChunks(job models.UploadJob, chunks []utils.Chunk, docIntel *utils.DocIntelligence) error {
 	var wg sync.WaitGroup
 	var errCount int32
 	var completedChunks int32
@@ -117,28 +220,22 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 			defer func() { <-embedSemaphore }()
 
 			start := time.Now()
-
-			// --- CẢI TIẾN: Contextual Enrichment ---
-			// Chỉ làm giàu nếu có Doc Intelligence (cần tóm tắt/chủ đề chính)
 			finalContent := c.Content
 			if docIntel != nil {
 				enriched, encErr := utils.EnrichChunk(c.Content, docIntel.MainTopic)
 				if encErr == nil {
 					finalContent = enriched
 				} else {
-					log.Printf("⚠️ [Enrich Error] Chunk %d in %s: %v", idx, job.DocID, encErr)
+					log.Printf("[Upload Pipeline] Enrich error doc %s chunk %d: %v", job.DocID, idx, encErr)
 				}
 			}
 
-			// GeminiEmbedPool nhận nội dung đã được làm giàu (Enriched)
 			vec, err := utils.GeminiEmbedPool.EmbedWithRetry(finalContent, utils.CallGeminiAPI)
 			latency := int(time.Since(start).Milliseconds())
-
 			if err != nil {
 				atomic.AddInt32(&errCount, 1)
 				atomic.AddInt32(&completedChunks, 1)
-				log.Printf("❌ [Embed Error] Doc %s Chunk %d: %v", job.DocID, idx, err)
-
+				log.Printf("[Upload Pipeline] Embed error doc %s chunk %d: %v", job.DocID, idx, err)
 				utils.LogTokenUsage(utils.TokenUsageLog{
 					UserID:      &job.UserID,
 					DocumentID:  &job.DocID,
@@ -152,7 +249,6 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 				return
 			}
 
-			// Log Success
 			utils.LogTokenUsage(utils.TokenUsageLog{
 				UserID:      &job.UserID,
 				DocumentID:  &job.DocID,
@@ -165,7 +261,7 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 
 			atomic.AddInt32(&completedChunks, 1)
 			p := 60 + int(float32(atomic.LoadInt32(&completedChunks))/float32(len(chunks))*35)
-			utils.UpdateDocProgress(job.DocID, "embedding", p)
+			utils.UpdateDocProgressDetail(job.DocID, "embedding", p, "Dang tao embedding", "")
 
 			vecStr := utils.FloatSliceToVectorString(vec)
 			_, err = config.DB.Exec(config.Ctx, `
@@ -175,78 +271,21 @@ TUYỆT ĐỐI KHÔNG tóm tắt nội dung, không giải thích thêm.`
 			)
 			if err != nil {
 				atomic.AddInt32(&errCount, 1)
-				log.Printf("❌ [DB Error] Doc %s Chunk %d: %v", job.DocID, idx, err)
+				log.Printf("[Upload Pipeline] Chunk DB error doc %s chunk %d: %v", job.DocID, idx, err)
 			}
 		}(i, chunkObj)
 	}
 	wg.Wait()
 
 	if errCount > 0 {
-		log.Printf("⚠️ [Pipeline Error] Doc %s finished with %d chunk errors. Marking document as error.", job.DocID, errCount)
-		utils.UpdateDocProgress(job.DocID, "error", 0)
 		_, _ = config.DB.Exec(config.Ctx, `DELETE FROM document_chunks WHERE document_id=$1`, job.DocID)
-		_, _ = config.DB.Exec(config.Ctx, `UPDATE documents SET status='error' WHERE id=$1`, job.DocID)
-		return fmt.Errorf("embedding pipeline failed with %d chunk errors", errCount)
-	}
-
-	utils.UpdateDocProgress(job.DocID, "ready", 100)
-	_, _ = config.DB.Exec(config.Ctx, `
-		UPDATE documents SET status='ready', file_hash=$1, cloudinary_url=NULL WHERE id=$2`,
-		hash, job.DocID)
-
-	// Làm mới cache cộng đồng (đảm bảo nếu doc đã được share thì sẽ hiện lên search ngay)
-	utils.ClearCommunityCache()
-
-	_, _ = config.DB.Exec(config.Ctx, `
-		INSERT INTO document_references (user_id, document_id, is_owner, pinned)
-		VALUES ($1, $2, TRUE, FALSE) ON CONFLICT DO NOTHING`,
-		job.UserID, job.DocID)
-
-	return nil
-}
-
-func deleteFromCloudinary(rawURL string) error {
-	cloudName := os.Getenv("CLOUDINARY_CLOUD_NAME")
-	apiKey := os.Getenv("CLOUDINARY_API_KEY")
-	apiSecret := os.Getenv("CLOUDINARY_API_SECRET")
-
-	if cloudName == "" || apiKey == "" || apiSecret == "" || rawURL == "" {
-		return nil // không cấu hình → bỏ qua
-	}
-
-	// Trích xuất public_id từ URL dạng:
-	// https://res.cloudinary.com/{cloud}/raw/upload/v{ver}/mindex_uploads/file.pdf
-	parts := strings.SplitN(rawURL, "/upload/", 2)
-	if len(parts) < 2 {
-		return fmt.Errorf("cloudinary url invalid: %s", rawURL)
-	}
-	publicID := parts[1]
-	// Bỏ version prefix "v1234567890/"
-	if len(publicID) > 1 && publicID[0] == 'v' {
-		if idx := strings.Index(publicID, "/"); idx != -1 {
-			publicID = publicID[idx+1:]
+		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Tao embedding that bai", "EMBEDDING_FAILED")
+		return &PipelineError{
+			Code:      "EMBEDDING_FAILED",
+			Message:   fmt.Sprintf("Embedding pipeline failed with %d chunk errors", errCount),
+			Retryable: true,
 		}
 	}
 
-	timestamp := time.Now().Unix()
-	sigString := fmt.Sprintf("public_id=%s&timestamp=%d%s", publicID, timestamp, apiSecret)
-	hash := sha256.Sum256([]byte(sigString))
-	signature := fmt.Sprintf("%x", hash)
-
-	destroyEndpoint := fmt.Sprintf("https://api.cloudinary.com/v1_1/%s/raw/destroy", cloudName)
-
-	formBody := fmt.Sprintf("public_id=%s&timestamp=%d&api_key=%s&signature=%s",
-		publicID, timestamp, apiKey, signature)
-
-	resp, err := http.Post(destroyEndpoint, "application/x-www-form-urlencoded",
-		strings.NewReader(formBody))
-	if err != nil {
-		return fmt.Errorf("cloudinary delete request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("cloudinary delete returned %d", resp.StatusCode)
-	}
 	return nil
 }

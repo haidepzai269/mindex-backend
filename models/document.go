@@ -8,7 +8,10 @@ type Document struct {
 	Title               string     `json:"title"`
 	FileHash            *string    `json:"file_hash,omitempty"`
 	CloudinaryURL       *string    `json:"cloudinary_url,omitempty"`
+	CloudinaryPublicID  *string    `json:"cloudinary_public_id,omitempty"`
 	Status              string     `json:"status"` // queued, processing, ready, error
+	ProcessingErrorCode *string    `json:"processing_error_code,omitempty"`
+	ProcessingError     *string    `json:"processing_error_message,omitempty"`
 	IsPublic            bool       `json:"is_public"`
 	IsSystem            bool       `json:"is_system"`
 	ExpiredAt           *time.Time `json:"expired_at,omitempty"`
@@ -30,4 +33,15 @@ type DocumentChunk struct {
 	TokenCount int       `json:"token_count"`
 	PageNumber int       `json:"page_number"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+type UploadJob struct {
+	ID                 string `json:"id"`
+	DocID              string `json:"doc_id"`
+	LocalPath          string `json:"local_path"`
+	UserID             string `json:"user_id"`
+	CloudinaryURL      string `json:"cloudinary_url"`
+	CloudinaryPublicID string `json:"cloudinary_public_id"`
+	Attempts           int    `json:"attempts"`
+	MaxAttempts        int    `json:"max_attempts"`
 }

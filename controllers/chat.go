@@ -243,6 +243,14 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 	writeChatInsight(c, flusher, fmt.Sprintf("Đã nhận câu hỏi: \"%s\".", compactChatPreview(req.Question, 120)))
 
 	// [Phase C] Keyword pre-filter: bắt social messages rõ ràng trước mọi DB/Redis/API call
+	if utils.IsSensitiveContent(req.Question) {
+		log.Printf("⚡ [CHAT] Keyword pre-filter: sensitive content detected for session=%s q=%q", req.SessionID, req.Question)
+		sensitiveMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
+		sendHardcodedSSEResponse(c, flusher, req.SessionID, sensitiveMsg)
+		go saveHardcodedToHistory(req.SessionID, req.Question, sensitiveMsg)
+		return
+	}
+
 	if isObviouslyOffTopic(req.Question) {
 		log.Printf("⚡ [CHAT] Keyword pre-filter: obvious off-topic for session=%s q=%q", req.SessionID, req.Question)
 		socialMsg := "Tôi chỉ hỗ trợ các câu hỏi liên quan đến nội dung tài liệu. Hãy thử hỏi về các khái niệm, định nghĩa hoặc thông tin được đề cập trong tài liệu bạn đang xem."
@@ -303,14 +311,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		writeChatInsight(c, flusher, "Đã tìm thấy lịch sử hội thoại, AI sẽ dùng nó để hiểu câu hỏi nối tiếp.")
 	}
 
-	// 3a. BM25 pre-check (SQL only, không cần API) — tin đầu tiên dùng query gốc
-	if isFirstMessage && !utils.QuickBM25Check(req.DocumentID, req.CollectionID, req.Question) {
-		log.Printf("⚡ [CHAT] BM25 pre-check: zero keyword match, skip embedding+rewrite for session=%s", req.SessionID)
-		offTopicMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
-		sendHardcodedSSEResponse(c, flusher, req.SessionID, offTopicMsg)
-		go saveHardcodedToHistory(req.SessionID, req.Question, offTopicMsg)
-		return
-	}
+
 
 	// 3. Query Rewrite (SYS-023) - Làm rõ câu hỏi dựa trên lịch sử trước khi search
 	searchQuery := utils.RewriteQueryWithHistory(req.Question, historySummary)
@@ -318,18 +319,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		writeChatInsight(c, flusher, fmt.Sprintf("Đã diễn giải lại câu hỏi để tìm kiếm chính xác hơn: \"%s\".", compactChatPreview(searchQuery, 140)))
 	}
 
-	// 3b. BM25 post-rewrite check cho follow-up messages — tiết kiệm Gemini embedding call
-	// nếu query đã rewrite vẫn không match keyword nào trong tài liệu.
-	if !isFirstMessage && !utils.QuickBM25Check(req.DocumentID, req.CollectionID, searchQuery) {
-		hasWebTrigger := config.Env.WebSearchEnabled && utils.WebSearchHeuristicTriggered(req.Question, searchQuery)
-		if !hasWebTrigger {
-			log.Printf("⚡ [CHAT] BM25 post-rewrite: zero keyword match for follow-up, skip embedding session=%s", req.SessionID)
-			offTopicMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
-			sendHardcodedSSEResponse(c, flusher, req.SessionID, offTopicMsg)
-			go saveHardcodedToHistory(req.SessionID, req.Question, offTopicMsg)
-			return
-		}
-	}
+
 
 	// 4. Vector Embed câu hỏi
 	writeChatInsight(c, flusher, "Đang tạo embedding để tìm các đoạn tài liệu liên quan.")

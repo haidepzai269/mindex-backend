@@ -1,0 +1,49 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─── BUILD & VET ──────────────────────────────────────────────────────────
+  build:
+    name: Build & Vet
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # đọc version từ go.mod (1.25)
+          cache: true               # cache module cache tự động
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build -o /dev/null .
+
+  # ─── DEPLOY TO RENDER (chỉ khi push vào main) ────────────────────────────
+  deploy:
+    name: Deploy to Render
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Trigger Render deploy hook
+        # RENDER_DEPLOY_HOOK_URL: lấy từ Render Dashboard → Service → Settings → Deploy Hook
+        # Thêm vào GitHub repo: Settings → Secrets → Actions → New repository secret
+        run: |
+          response=$(curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}")
+          echo "Render response: $response"
+          deploy_id=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deploy',{}).get('id',''))" 2>/dev/null || echo "")
+          if [ -n "$deploy_id" ]; then
+            echo "Deploy triggered: https://dashboard.render.com/deploys/$deploy_id"
+          fi

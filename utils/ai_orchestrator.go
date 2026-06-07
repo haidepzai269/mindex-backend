@@ -18,6 +18,7 @@ const (
 	ServiceClassify ServiceType = "CLASSIFY"
 	ServiceSearch   ServiceType = "SEARCH"
 	ServiceAudio    ServiceType = "AUDIO"
+	ServiceTitleGen ServiceType = "TITLE_GEN"
 )
 
 // ProviderType định nghĩa loại Provider
@@ -101,6 +102,15 @@ func InitOrchestrator() {
 		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderGemini, Model: "gemini-1.5-flash", Pool: GeminiChatPool, IsOpenAI: false},
 	}
+
+	// 6. ĐẶT TÊN SESSION (TITLE_GEN) - NineRouter Model2 ưu tiên, fallback các provider còn lại
+	AI.Priorities[ServiceTitleGen] = []AIProviderConfig{
+		{Type: ProviderNineRouter, Model: config.Env.NineRouterChatModel, Pool: NineRouterChatPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
+		{Type: ProviderGemini, Model: "gemini-2.5-flash-lite", Pool: GeminiChatPool, IsOpenAI: false},
+		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
+		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
+		{Type: ProviderOpenRouter, Model: "google/gemini-2.0-flash-exp:free", Pool: OpenRouterPool, IsOpenAI: true, BaseURL: "https://openrouter.ai/api/v1"},
+	}
 }
 
 // ChatStream thực hiện gọi stream chat với cơ chế fallback
@@ -150,8 +160,12 @@ func (o *AIOrchestrator) ChatStream(service ServiceType, c *gin.Context, message
 		}
 
 		if err == nil {
-			log.Printf("✅ [Orchestrator] [%s] Thành công với %s", service, cfg.Type)
-			return answer, cfg.Type, nil
+			if strings.TrimSpace(answer) == "" {
+				err = fmt.Errorf("provider %s trả về stream rỗng", cfg.Type)
+			} else {
+				log.Printf("✅ [Orchestrator] [%s] Thành công với %s (%d chars)", service, cfg.Type, len(answer))
+				return answer, cfg.Type, nil
+			}
 		}
 
 		lastErr = err

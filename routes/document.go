@@ -22,6 +22,7 @@ func RegisterDocumentRoutes(rg *gin.RouterGroup) {
 	// Quản lý tài liệu cá nhân
 	doc.GET("/documents", controllers.GetMyDocuments)
 	doc.GET("/documents/:id", controllers.GetDocumentDetail)
+	doc.GET("/documents/:id/content", controllers.GetDocumentContent)
 	doc.PATCH("/documents/:id/pin", controllers.TogglePinDocument)
 	doc.PATCH("/documents/:id/persona", controllers.UpdateDocumentPersona)
 	doc.DELETE("/documents/:id", controllers.DeleteDocument)
@@ -31,13 +32,18 @@ func RegisterDocumentRoutes(rg *gin.RouterGroup) {
 	heavyRL := middleware.RateLimit("ai_heavy", 10, time.Minute) // 10 req/phút cho heavy ops
 
 	doc.POST("/summary/quick", aiRL, controllers.QuickSummary)
-	doc.POST("/summary/detailed", heavyRL, controllers.DetailedSummary)    // Map-Reduce, đắt nhất
+	doc.POST("/summary/detailed", heavyRL, controllers.DetailedSummary) // Map-Reduce, đắt nhất
 	doc.GET("/summary/cache/:id", controllers.GetCachedSummary)
 	doc.POST("/extract/keywords", aiRL, controllers.ExtractKeywords)
+	doc.POST("/extract/keywords/stream", aiRL, controllers.ExtractKeywordsStream)
 	doc.POST("/extract/timeline", aiRL, controllers.ExtractTimeline)
+	doc.POST("/extract/timeline/stream", aiRL, controllers.ExtractTimelineStream)
 	doc.POST("/extract/formulas", aiRL, controllers.ExtractFormulas)
-	doc.POST("/extract/compare", heavyRL, controllers.ExtractCompare)      // So sánh nhiều doc
+	doc.POST("/extract/formulas/stream", aiRL, controllers.ExtractFormulasStream)
+	doc.POST("/extract/compare", heavyRL, controllers.ExtractCompare) // So sánh nhiều doc
+	doc.POST("/extract/compare/stream", heavyRL, controllers.ExtractCompareStream)
 	doc.POST("/extract/mindmap", aiRL, controllers.ExtractMindMap)
+	doc.POST("/extract/mindmap/stream", aiRL, controllers.ExtractMindMapStream)
 
 	// Community Library (cần login)
 	doc.PATCH("/community/documents/:id", controllers.AddCommunityLibrary)           // Share/Unshare

@@ -58,9 +58,9 @@ func setTokenCookies(c *gin.Context, access, refresh string, rememberMe bool) {
 }
 
 type RegisterReq struct {
-	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required,min=8"`
-	Name     string `json:"name" binding:"required"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	Name     string `json:"name"`
 	Persona  string `json:"persona"` // Optional
 }
 
@@ -73,7 +73,31 @@ type LoginReq struct {
 func Register(c *gin.Context) {
 	var req RegisterReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"success": false, "error": "VALIDATION_ERROR", "message": "Email sai định dạng hoặc password < 8 ký tự"})
+		c.JSON(400, gin.H{"success": false, "error": "VALIDATION_ERROR", "message": "Dữ liệu yêu cầu không hợp lệ"})
+		return
+	}
+
+	req.Email = strings.TrimSpace(req.Email)
+	req.Name = strings.TrimSpace(req.Name)
+
+	if req.Name == "" {
+		c.JSON(400, gin.H{"success": false, "error": "VALIDATION_ERROR", "message": "Vui lòng nhập họ và tên"})
+		return
+	}
+
+	if req.Email == "" {
+		c.JSON(400, gin.H{"success": false, "error": "VALIDATION_ERROR", "message": "Vui lòng nhập email sinh viên"})
+		return
+	}
+
+	// Kiểm tra định dạng email cơ bản
+	if !strings.Contains(req.Email, "@") || !strings.Contains(req.Email, ".") {
+		c.JSON(400, gin.H{"success": false, "error": "VALIDATION_ERROR", "message": "Email không đúng định dạng"})
+		return
+	}
+
+	if len(req.Password) < 8 {
+		c.JSON(400, gin.H{"success": false, "error": "VALIDATION_ERROR", "message": "Mật khẩu phải chứa tối thiểu 8 ký tự"})
 		return
 	}
 

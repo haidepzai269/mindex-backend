@@ -12,15 +12,18 @@ import (
 )
 
 type DocumentItem struct {
-	ID         string     `json:"id"`
-	Title      string     `json:"title"`
-	Status     string     `json:"status"`
-	CreatedAt  time.Time  `json:"created_at"`
-	SharedAt   *time.Time `json:"shared_at"`
-	ExpiredAt  *time.Time `json:"expired_at"`
-	Pinned     bool       `json:"pinned"`
-	IsPublic   bool       `json:"is_public"`
-	ChunkCount int        `json:"chunk_count"`
+	ID            string     `json:"id"`
+	Title         string     `json:"title"`
+	Status        string     `json:"status"`
+	CreatedAt     time.Time  `json:"created_at"`
+	SharedAt      *time.Time `json:"shared_at"`
+	ExpiredAt     *time.Time `json:"expired_at"`
+	CloudinaryURL *string    `json:"cloudinary_url,omitempty"`
+	ErrorCode     *string    `json:"processing_error_code,omitempty"`
+	ErrorMessage  *string    `json:"processing_error_message,omitempty"`
+	Pinned        bool       `json:"pinned"`
+	IsPublic      bool       `json:"is_public"`
+	ChunkCount    int        `json:"chunk_count"`
 }
 
 // GetMyDocuments trả về danh sách tài liệu của người dùng hiện tại (Có Cache)
@@ -43,7 +46,9 @@ func GetMyDocuments(c *gin.Context) {
 
 	// 2. Nếu không có cache, truy vấn DB
 	rows, err := config.DB.Query(config.Ctx, `
-		SELECT d.id, d.title, d.status, d.created_at, d.shared_at, d.expired_at, dr.pinned, d.is_public,
+		SELECT d.id, d.title, d.status, d.created_at, d.shared_at, d.expired_at,
+		       d.cloudinary_url, d.processing_error_code, d.processing_error_message,
+		       dr.pinned, d.is_public,
 		       (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) as chunk_count
 		FROM documents d
 		JOIN document_references dr ON d.id = dr.document_id
@@ -69,6 +74,9 @@ func GetMyDocuments(c *gin.Context) {
 			&d.CreatedAt,
 			&d.SharedAt,
 			&d.ExpiredAt,
+			&d.CloudinaryURL,
+			&d.ErrorCode,
+			&d.ErrorMessage,
 			&d.Pinned,
 			&d.IsPublic,
 			&d.ChunkCount,
@@ -125,7 +133,9 @@ func GetDocumentDetail(c *gin.Context) {
 
 	var d DocumentItem
 	err := config.DB.QueryRow(config.Ctx, `
-		SELECT d.id, d.title, d.status, d.created_at, d.shared_at, d.expired_at, COALESCE(dr.pinned, FALSE), d.is_public,
+		SELECT d.id, d.title, d.status, d.created_at, d.shared_at, d.expired_at,
+		       d.cloudinary_url, d.processing_error_code, d.processing_error_message,
+		       COALESCE(dr.pinned, FALSE), d.is_public,
 		       (SELECT COUNT(*) FROM document_chunks WHERE document_id = d.id) as chunk_count
 		FROM documents d
 		LEFT JOIN document_references dr ON d.id = dr.document_id AND dr.user_id = $2
@@ -139,6 +149,9 @@ func GetDocumentDetail(c *gin.Context) {
 		&d.CreatedAt,
 		&d.SharedAt,
 		&d.ExpiredAt,
+		&d.CloudinaryURL,
+		&d.ErrorCode,
+		&d.ErrorMessage,
 		&d.Pinned,
 		&d.IsPublic,
 		&d.ChunkCount,
@@ -294,6 +307,16 @@ func DeleteDocument(c *gin.Context) {
 	).Scan(&refCount)
 
 	if err == nil && refCount == 0 {
+		var publicID *string
+		defer func() {
+			if err == nil && refCount == 0 && publicID != nil && *publicID != "" {
+				if cleanupErr := utils.DestroyRawFromCloudinary(*publicID); cleanupErr != nil {
+					log.Printf("[Cleanup] Cloudinary delete failed for document %s: %v", docID, cleanupErr)
+				}
+			}
+		}()
+		_ = config.DB.QueryRow(config.Ctx, `SELECT cloudinary_public_id FROM documents WHERE id = $1`, docID).Scan(&publicID)
+
 		// 4. Nếu không còn ai dùng -> Xóa bản ghi gốc trong documents
 		// (ON DELETE CASCADE sẽ tự xóa document_chunks)
 		_, err = config.DB.Exec(config.Ctx, `DELETE FROM documents WHERE id = $1`, docID)
@@ -355,4 +378,56 @@ func UpdateDocumentPersona(c *gin.Context) {
 	utils.ClearUserCache("docs", userID)
 	utils.ClearCommunityCache()
 	c.JSON(200, gin.H{"success": true, "message": "Đã cập nhật lĩnh vực tài liệu"})
+}
+
+// GetDocumentContent trả về nội dung text của tài liệu (từ document_chunks)
+// dùng cho Document Reader sidebar trên frontend.
+func GetDocumentContent(c *gin.Context) {
+	docID := c.Param("id")
+
+	var title string
+	err := config.DB.QueryRow(config.Ctx, `SELECT title FROM documents WHERE id = $1`, docID).Scan(&title)
+	if err != nil {
+		c.JSON(404, gin.H{"success": false, "message": "Tài liệu không tồn tại"})
+		return
+	}
+
+	rows, err := config.DB.Query(config.Ctx, `
+		SELECT COALESCE(chunk_index, 0), COALESCE(page_number, 0), content
+		FROM document_chunks
+		WHERE document_id = $1
+		ORDER BY chunk_index ASC`, docID)
+	if err != nil {
+		log.Printf("❌ [GetDocumentContent] Query failed for doc %s: %v", docID, err)
+		c.JSON(500, gin.H{"success": false, "message": "Không thể tải nội dung tài liệu"})
+		return
+	}
+	defer rows.Close()
+
+	type ChunkItem struct {
+		ChunkIndex int    `json:"chunk_index"`
+		PageNumber int    `json:"page_number"`
+		Content    string `json:"content"`
+	}
+
+	var chunks []ChunkItem
+	for rows.Next() {
+		var ch ChunkItem
+		if err := rows.Scan(&ch.ChunkIndex, &ch.PageNumber, &ch.Content); err != nil {
+			continue
+		}
+		chunks = append(chunks, ch)
+	}
+
+	if chunks == nil {
+		chunks = []ChunkItem{}
+	}
+
+	c.JSON(200, gin.H{
+		"success": true,
+		"data": gin.H{
+			"title":  title,
+			"chunks": chunks,
+		},
+	})
 }
