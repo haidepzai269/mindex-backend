@@ -60,6 +60,28 @@ type KeyUsage struct {
 	mu sync.Mutex
 }
 
+// Clone creates a safe snapshot of KeyUsage without copying the Mutex
+func (u *KeyUsage) Clone() *KeyUsage {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return &KeyUsage{
+		KeyID:            u.KeyID,
+		ApiKey:           u.ApiKey,
+		Provider:         u.Provider,
+		AccountNote:      u.AccountNote,
+		RPMRemaining:     u.RPMRemaining,
+		RPMLimit:         u.RPMLimit,
+		TPMRemaining:     u.TPMRemaining,
+		TPMLimit:         u.TPMLimit,
+		ResetAt:          u.ResetAt,
+		RPDUsed:          u.RPDUsed,
+		MonthlyTokenUsed: u.MonthlyTokenUsed,
+		IsRateLimited:    u.IsRateLimited,
+		LastUsed:         u.LastUsed,
+		LastError:        u.LastError,
+	}
+}
+
 type Tracker struct {
 	keys map[string]*KeyUsage // apiKey -> usage
 	mu   sync.RWMutex
@@ -329,11 +351,9 @@ func (t *Tracker) syncLoop() {
 
 func (t *Tracker) SyncToDB() {
 	t.mu.RLock()
-	snap := make([]KeyUsage, 0, len(t.keys))
+	snap := make([]*KeyUsage, 0, len(t.keys))
 	for _, u := range t.keys {
-		u.mu.Lock()
-		snap = append(snap, *u)
-		u.mu.Unlock()
+		snap = append(snap, u.Clone())
 	}
 	t.mu.RUnlock()
 
@@ -352,15 +372,13 @@ func (t *Tracker) SyncToDB() {
 }
 
 // GetAllUsage returns a snapshot for the UI
-func (t *Tracker) GetAllUsage() []KeyUsage {
+func (t *Tracker) GetAllUsage() []*KeyUsage {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	result := make([]KeyUsage, 0, len(t.keys))
+	result := make([]*KeyUsage, 0, len(t.keys))
 	for _, u := range t.keys {
-		u.mu.Lock()
-		result = append(result, *u)
-		u.mu.Unlock()
+		result = append(result, u.Clone())
 	}
 	return result
 }
@@ -374,7 +392,7 @@ func (t *Tracker) GetProviderSummary() map[string]*ProviderSummary {
 		if _, ok := summaries[u.Provider]; !ok {
 			summaries[u.Provider] = &ProviderSummary{
 				Provider: u.Provider,
-				Keys:     []KeyUsage{},
+				Keys:     []*KeyUsage{},
 			}
 		}
 		s := summaries[u.Provider]
@@ -390,12 +408,12 @@ func (t *Tracker) GetProviderSummary() map[string]*ProviderSummary {
 }
 
 type ProviderSummary struct {
-	Provider               string     `json:"provider"`
-	TotalKeys              int        `json:"total_keys"`
-	RateLimitedKeys        int        `json:"rate_limited_keys"`
-	TotalRPDUsed           int64      `json:"total_rpd_used"`
-	TotalMonthlyTokenUsed  int64      `json:"total_monthly_token_used"`
-	Keys                   []KeyUsage `json:"keys"`
+	Provider               string       `json:"provider"`
+	TotalKeys              int          `json:"total_keys"`
+	RateLimitedKeys        int          `json:"rate_limited_keys"`
+	TotalRPDUsed           int64        `json:"total_rpd_used"`
+	TotalMonthlyTokenUsed  int64        `json:"total_monthly_token_used"`
+	Keys                   []*KeyUsage  `json:"keys"`
 }
 
 // HTTPHandler returns a handler for /api/v1/admin/quota endpoint
