@@ -1,19 +1,20 @@
 package controllers
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"log"
+	"math/big"
 	"mindex-backend/config"
 	"mindex-backend/internal/persona"
 	"mindex-backend/models"
 	"mindex-backend/utils"
+	"net/http"
 	"strings"
 	"time"
 
-	"crypto/rand"
-	"io/ioutil"
-	"math/big"
-	"net/http"
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/api/idtoken"
@@ -101,7 +102,11 @@ func Register(c *gin.Context) {
 		return
 	}
 
-	hashed, _ := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "error": "INTERNAL_ERROR", "message": "Không thể xử lý mật khẩu"})
+		return
+	}
 
 	personaVal := req.Persona
 	personaSet := true
@@ -111,9 +116,9 @@ func Register(c *gin.Context) {
 	}
 
 	var userID string
-	err := config.DB.QueryRow(
+	err = config.DB.QueryRow(
 		config.Ctx,
-		`INSERT INTO users (email, name, password_hash, persona, persona_set) 
+		`INSERT INTO users (email, name, password_hash, persona, persona_set)
 		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
 		req.Email, req.Name, string(hashed), personaVal, personaSet,
 	).Scan(&userID)
@@ -133,6 +138,7 @@ func Register(c *gin.Context) {
 	}
 
 	access, refresh, _ := utils.GenerateTokenPair(userID, "user", personaVal)
+	log.Printf("[AUDIT] REGISTER user_id=%s email=%s ip=%s", userID, req.Email, c.ClientIP())
 
 	setTokenCookies(c, access, refresh, false)
 
@@ -170,11 +176,13 @@ func Login(c *gin.Context) {
 	).Scan(&user.ID, &user.Email, &user.Name, &user.PasswordHash, &user.Role, &user.Persona, &user.PersonaSet, &user.Bio, &user.URLs, &user.AvatarURL)
 
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)) != nil {
+		log.Printf("[AUDIT] LOGIN_FAILED email=%s ip=%s", req.Email, c.ClientIP())
 		c.JSON(401, gin.H{"success": false, "error": "INVALID_CREDENTIALS", "message": "Sai email hoặc mật khẩu"})
 		return
 	}
 
 	access, refresh, _ := utils.GenerateTokenPair(user.ID, user.Role, user.Persona)
+	log.Printf("[AUDIT] LOGIN_SUCCESS user_id=%s email=%s ip=%s", user.ID, user.Email, c.ClientIP())
 
 	// Xử lý Redis Session nếu chọn Remember Me
 	if req.RememberMe && config.RedisClient != nil {
@@ -498,7 +506,11 @@ func ChangePassword(c *gin.Context) {
 		return
 	}
 
-	hashedNew, _ := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
+	hashedNew, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "error": "INTERNAL_ERROR", "message": "Không thể xử lý mật khẩu"})
+		return
+	}
 	_, err = config.DB.Exec(config.Ctx, "UPDATE users SET password_hash = $1 WHERE id = $2", string(hashedNew), userID)
 	if err != nil {
 		c.JSON(500, gin.H{"success": false, "message": "Không thể cập nhật mật khẩu"})
@@ -510,6 +522,7 @@ func ChangePassword(c *gin.Context) {
 		config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID))
 	}
 
+	log.Printf("[AUDIT] PASSWORD_CHANGE user_id=%s ip=%s", userID, c.ClientIP())
 	c.JSON(200, gin.H{"success": true, "message": "Đã đổi mật khẩu thành công"})
 }
 
@@ -553,32 +566,23 @@ func ForgotPasswordSendOTP(c *gin.Context) {
 		return
 	}
 
-	// Kiểm tra email tồn tại
+	// Luôn trả về 200 cùng message dù email tồn tại hay không (chống account enumeration).
+	// OTP chỉ được tạo và gửi nếu email thực sự tồn tại.
 	var userID string
-	err := config.DB.QueryRow(config.Ctx, "SELECT id FROM users WHERE email = $1", req.Email).Scan(&userID)
-	if err != nil {
-		// Để bảo mật, không báo là email không tồn tại, chỉ báo thành công giả định nếu muốn, 
-		// nhưng ở đây có thể báo lỗi cho tiện UX.
-		c.JSON(404, gin.H{"success": false, "message": "Email không tồn tại trong hệ thống"})
-		return
+	exists := config.DB.QueryRow(config.Ctx, "SELECT id FROM users WHERE email = $1", req.Email).Scan(&userID) == nil
+
+	if exists {
+		otp := generateOTP()
+		if config.RedisClient != nil {
+			cacheKey := fmt.Sprintf("otp:reset:%s", req.Email)
+			config.RedisClient.Set(config.Ctx, cacheKey, otp, 5*time.Minute)
+		}
+		if err := utils.SendOTPEmail(req.Email, otp, "Khôi phục mật khẩu"); err != nil {
+			log.Printf("[Auth] ForgotPassword: failed to send OTP to %s: %v", req.Email, err)
+		}
 	}
 
-	otp := generateOTP()
-
-	// Lưu vào Redis theo Email (5 phút)
-	if config.RedisClient != nil {
-		cacheKey := fmt.Sprintf("otp:reset:%s", req.Email)
-		config.RedisClient.Set(config.Ctx, cacheKey, otp, 5*time.Minute)
-	}
-
-	// Gửi Email
-	err = utils.SendOTPEmail(req.Email, otp, "Khôi phục mật khẩu")
-	if err != nil {
-		c.JSON(500, gin.H{"success": false, "message": "Không thể gửi email xác thực"})
-		return
-	}
-
-	c.JSON(200, gin.H{"success": true, "message": "Mã khôi phục đã được gửi tới email của bạn"})
+	c.JSON(200, gin.H{"success": true, "message": "Nếu email tồn tại trong hệ thống, mã khôi phục đã được gửi."})
 }
 
 // ResetPassword đặt lại mật khẩu bằng mã OTP
@@ -606,15 +610,20 @@ func ResetPassword(c *gin.Context) {
 	}
 
 	// 2. Hash mật khẩu mới
-	hashed, _ := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
+	hashed, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), 12)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "error": "INTERNAL_ERROR", "message": "Không thể xử lý mật khẩu"})
+		return
+	}
 
 	// 3. Cập nhật DB
-	_, err := config.DB.Exec(config.Ctx, "UPDATE users SET password_hash = $1 WHERE email = $2", string(hashed), req.Email)
+	_, err = config.DB.Exec(config.Ctx, "UPDATE users SET password_hash = $1 WHERE email = $2", string(hashed), req.Email)
 	if err != nil {
 		c.JSON(500, gin.H{"success": false, "message": "Không thể cập nhật mật khẩu"})
 		return
 	}
 
+	log.Printf("[AUDIT] PASSWORD_RESET email=%s ip=%s", req.Email, c.ClientIP())
 	c.JSON(200, gin.H{"success": true, "message": "Mật khẩu đã được đặt lại thành công"})
 }
 
@@ -658,6 +667,7 @@ func Logout(c *gin.Context) {
 	if userID != "" && config.RedisClient != nil {
 		config.RedisClient.Del(config.Ctx, fmt.Sprintf("session:%s", userID))
 	}
+	log.Printf("[AUDIT] LOGOUT user_id=%s ip=%s", userID, c.ClientIP())
 
 	c.JSON(200, gin.H{
 		"success": true,
@@ -737,10 +747,14 @@ func GoogleLogin(c *gin.Context) {
 		personaVal := "student"
 		personaSet := false
 		randomPass := fmt.Sprintf("GOOGLE_AUTH_%d", time.Now().UnixNano())
-		hashed, _ := bcrypt.GenerateFromPassword([]byte(randomPass), 12)
+		hashed, err := bcrypt.GenerateFromPassword([]byte(randomPass), 12)
+		if err != nil {
+			c.JSON(500, gin.H{"success": false, "message": "Không thể tạo tài khoản từ Google"})
+			return
+		}
 
 		err = config.DB.QueryRow(config.Ctx, `
-			INSERT INTO users (email, name, google_id, password_hash, persona, persona_set, avatar_url) 
+			INSERT INTO users (email, name, google_id, password_hash, persona, persona_set, avatar_url)
 			VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
 			email, name, googleID, string(hashed), personaVal, personaSet, avatarURL,
 		).Scan(&user.ID)
@@ -778,6 +792,7 @@ func GoogleLogin(c *gin.Context) {
 
 	// 3. Tạo JWT & Set Cookie
 	access, refresh, _ := utils.GenerateTokenPair(user.ID, user.Role, user.Persona)
+	log.Printf("[AUDIT] GOOGLE_LOGIN user_id=%s email=%s ip=%s", user.ID, user.Email, c.ClientIP())
 	setTokenCookies(c, access, refresh, true)
 
 	c.JSON(200, gin.H{
