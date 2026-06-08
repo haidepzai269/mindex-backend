@@ -307,23 +307,15 @@ func DeleteDocument(c *gin.Context) {
 	).Scan(&refCount)
 
 	if err == nil && refCount == 0 {
-		var publicID *string
-		defer func() {
-			if err == nil && refCount == 0 && publicID != nil && *publicID != "" {
-				if cleanupErr := utils.DestroyRawFromCloudinary(*publicID); cleanupErr != nil {
-					log.Printf("[Cleanup] Cloudinary delete failed for document %s: %v", docID, cleanupErr)
-				}
-			}
-		}()
-		_ = config.DB.QueryRow(config.Ctx, `SELECT cloudinary_public_id FROM documents WHERE id = $1`, docID).Scan(&publicID)
-
-		// 4. Nếu không còn ai dùng -> Xóa bản ghi gốc trong documents
-		// (ON DELETE CASCADE sẽ tự xóa document_chunks)
-		_, err = config.DB.Exec(config.Ctx, `DELETE FROM documents WHERE id = $1`, docID)
+		// Soft-delete: giữ lại chunks 7 ngày để restore nếu user upload lại cùng file.
+		// Sweeper sẽ hard-delete sau 7 ngày và dọn Cloudinary lúc đó.
+		// expired_at = NOW() ẩn khỏi community/search queries mà không cần sửa từng query.
+		_, err = config.DB.Exec(config.Ctx,
+			`UPDATE documents SET deleted_at = NOW(), expired_at = NOW() WHERE id = $1`, docID)
 		if err != nil {
-			log.Printf("Error deleting root document %s: %v", docID, err)
+			log.Printf("[Cleanup] Soft-delete failed for document %s: %v", docID, err)
 		} else {
-			log.Printf("🧹 [Cleanup] Root document %s and its chunks have been fully deleted.", docID)
+			log.Printf("🗑 [Cleanup] Document %s soft-deleted, chunks preserved 7 days.", docID)
 		}
 	}
 
@@ -384,6 +376,20 @@ func UpdateDocumentPersona(c *gin.Context) {
 // dùng cho Document Reader sidebar trên frontend.
 func GetDocumentContent(c *gin.Context) {
 	docID := c.Param("id")
+	cacheKey := fmt.Sprintf("doc:content:%s", docID)
+
+	// 1. Kiểm tra Cache
+	if cacheData := utils.GetCache(cacheKey); cacheData != "" {
+		var responseData gin.H
+		if err := json.Unmarshal([]byte(cacheData), &responseData); err == nil {
+			c.JSON(200, gin.H{
+				"success": true,
+				"data":    responseData,
+				"cached":  true,
+			})
+			return
+		}
+	}
 
 	var title string
 	err := config.DB.QueryRow(config.Ctx, `SELECT title FROM documents WHERE id = $1`, docID).Scan(&title)
@@ -423,11 +429,18 @@ func GetDocumentContent(c *gin.Context) {
 		chunks = []ChunkItem{}
 	}
 
+	responseData := gin.H{
+		"title":  title,
+		"chunks": chunks,
+	}
+
+	// 2. Lưu vào Cache với TTL 24h
+	if jsonData, err := json.Marshal(responseData); err == nil {
+		utils.SetCache(cacheKey, string(jsonData), 24*time.Hour)
+	}
+
 	c.JSON(200, gin.H{
 		"success": true,
-		"data": gin.H{
-			"title":  title,
-			"chunks": chunks,
-		},
+		"data":    responseData,
 	})
 }

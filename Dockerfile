@@ -28,6 +28,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     python3-dev \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-vie \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install python dependencies
@@ -39,6 +42,7 @@ COPY --from=builder /app/main .
 
 # Copy other necessary files (scripts, templates, etc.)
 COPY extractor.py .
+COPY image_ocr.py .
 
 # Expose port
 EXPOSE 8080

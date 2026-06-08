@@ -27,7 +27,9 @@ import (
 
 const (
 	maxDocumentUploadSize = int64(50 * 1024 * 1024)
-	maxMultipartBodySize  = maxDocumentUploadSize + int64(1024*1024)
+	maxImageUploadSize    = int64(5 * 1024 * 1024)
+	maxImageCount         = 5
+	maxMultipartBodySize  = maxDocumentUploadSize + maxImageCount*maxImageUploadSize + int64(1024*1024)
 	uploadJobMaxAttempts  = 3
 )
 
@@ -54,6 +56,7 @@ type existingDocument struct {
 	Status             string
 	ExpiredAt          *time.Time
 	CloudinaryPublicID *string
+	DeletedAt          *time.Time
 }
 
 func PresignUpload(c *gin.Context) {
@@ -101,6 +104,11 @@ func InitiateUpload(c *gin.Context) {
 		return
 	}
 
+	var rawImageHeaders []*multipart.FileHeader
+	if c.Request.MultipartForm != nil {
+		rawImageHeaders = c.Request.MultipartForm.File["images"]
+	}
+
 	roomID := strings.TrimSpace(c.PostForm("room_id"))
 	if roomID != "" && !IsRoomMember(roomID, userID) {
 		c.JSON(403, gin.H{"success": false, "error": "NOT_ROOM_MEMBER", "message": "Ban khong co quyen upload vao phong nay"})
@@ -114,21 +122,55 @@ func InitiateUpload(c *gin.Context) {
 		return
 	}
 
+	imagePaths, err := saveUploadedImages(rawImageHeaders, docID)
+	if err != nil {
+		_ = os.Remove(localPath)
+		writeUploadError(c, err)
+		return
+	}
+	cleanupImages := func() {
+		for _, p := range imagePaths {
+			_ = os.Remove(p)
+		}
+	}
+
 	existing, found, err := findExistingDocumentByHash(fileHash)
 	if err != nil {
 		_ = os.Remove(localPath)
+		cleanupImages()
 		c.JSON(500, gin.H{"success": false, "error": "DEDUP_CHECK_FAILED", "message": "Khong the kiem tra tai lieu trung lap"})
 		return
 	}
 	if found {
+		// Ưu tiên xử lý soft-deleted trước: restore không cần chạy pipeline.
+		if existing.DeletedAt != nil {
+			_ = os.Remove(localPath)
+			cleanupImages()
+			restoreSoftDeletedDocument(c, existing, roomID, userID)
+			return
+		}
 		if existing.ExpiredAt != nil && existing.ExpiredAt.Before(time.Now()) {
+			// Tài liệu đã hết hạn, nhưng kiểm tra trước xem còn user nào đang dùng không.
+			// Nếu còn reference thì không được xóa (tránh cascade-xóa dữ liệu của user khác).
+			var refCount int
+			_ = config.DB.QueryRow(config.Ctx,
+				`SELECT COUNT(*) FROM document_references WHERE document_id = $1`, existing.ID,
+			).Scan(&refCount)
+			if refCount > 0 {
+				_ = os.Remove(localPath)
+				cleanupImages()
+				handleDuplicateDocument(c, existing, roomID, userID)
+				return
+			}
 			if err := deleteExpiredDuplicate(existing); err != nil {
 				_ = os.Remove(localPath)
+				cleanupImages()
 				c.JSON(500, gin.H{"success": false, "error": "EXPIRED_DUPLICATE_CLEANUP_FAILED", "message": "Khong the lam moi tai lieu da het han"})
 				return
 			}
 		} else {
 			_ = os.Remove(localPath)
+			cleanupImages()
 			handleDuplicateDocument(c, existing, roomID, userID)
 			return
 		}
@@ -137,6 +179,7 @@ func InitiateUpload(c *gin.Context) {
 	if roomID != "" {
 		if err := ensureRoomDocQuota(roomID, userID); err != nil {
 			_ = os.Remove(localPath)
+			cleanupImages()
 			writeUploadError(c, err)
 			return
 		}
@@ -146,13 +189,15 @@ func InitiateUpload(c *gin.Context) {
 	cloudinaryUpload, err := utils.UploadRawToCloudinary(localPath, publicID)
 	if err != nil {
 		_ = os.Remove(localPath)
+		cleanupImages()
 		log.Printf("[Upload] Cloudinary upload failed: %v", err)
 		c.JSON(502, gin.H{"success": false, "error": "CLOUDINARY_UPLOAD_FAILED", "message": "Khong the luu file goc len Cloudinary"})
 		return
 	}
 
-	if err := createDocumentAndUploadJob(docID, userID, fileInfo.FileName, userPersona, fileHash, roomID, localPath, cloudinaryUpload); err != nil {
+	if err := createDocumentAndUploadJob(docID, userID, fileInfo.FileName, userPersona, fileHash, roomID, localPath, cloudinaryUpload, imagePaths); err != nil {
 		_ = os.Remove(localPath)
+		cleanupImages()
 		_ = utils.DestroyRawFromCloudinary(cloudinaryUpload.PublicID)
 
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -179,7 +224,7 @@ func InitiateUpload(c *gin.Context) {
 			"document_id":  docID,
 			"status":       "queued",
 			"is_duplicate": false,
-			"message":      "Tai len thanh cong, dang bat dau xu ly...",
+			"message":      "Tải lên thành công , đang bắt đầu xử lý...",
 		},
 	})
 }
@@ -318,11 +363,14 @@ func saveUploadedDocument(fileHeader *multipart.FileHeader, fileName string, doc
 
 func findExistingDocumentByHash(fileHash string) (existingDocument, bool, error) {
 	var doc existingDocument
+	// Ưu tiên doc đang sống (deleted_at IS NULL) trước, rồi mới đến soft-deleted.
+	// ORDER BY fix non-deterministic LIMIT 1 khi có nhiều row cùng hash.
 	err := config.DB.QueryRow(config.Ctx, `
-		SELECT id, status, expired_at, cloudinary_public_id
+		SELECT id, status, expired_at, cloudinary_public_id, deleted_at
 		FROM documents
 		WHERE file_hash = $1
-		LIMIT 1`, fileHash).Scan(&doc.ID, &doc.Status, &doc.ExpiredAt, &doc.CloudinaryPublicID)
+		ORDER BY deleted_at NULLS FIRST, created_at DESC
+		LIMIT 1`, fileHash).Scan(&doc.ID, &doc.Status, &doc.ExpiredAt, &doc.CloudinaryPublicID, &doc.DeletedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return existingDocument{}, false, nil
 	}
@@ -347,7 +395,7 @@ func deleteExpiredDuplicate(doc existingDocument) error {
 	return nil
 }
 
-func createDocumentAndUploadJob(docID, userID, title, persona, fileHash, roomID, localPath string, upload *utils.CloudinaryUploadResult) error {
+func createDocumentAndUploadJob(docID, userID, title, persona, fileHash, roomID, localPath string, upload *utils.CloudinaryUploadResult, imagePaths []string) error {
 	tx, err := config.DB.Begin(config.Ctx)
 	if err != nil {
 		return err
@@ -383,8 +431,8 @@ func createDocumentAndUploadJob(docID, userID, title, persona, fileHash, roomID,
 	}
 
 	if _, err = tx.Exec(config.Ctx, `
-		INSERT INTO upload_jobs (document_id, user_id, local_path, cloudinary_url, cloudinary_public_id, status, attempts, max_attempts, next_run_at)
-		VALUES ($1, $2, $3, $4, $5, 'queued', 0, $6, NOW())
+		INSERT INTO upload_jobs (document_id, user_id, local_path, cloudinary_url, cloudinary_public_id, status, attempts, max_attempts, next_run_at, image_paths)
+		VALUES ($1, $2, $3, $4, $5, 'queued', 0, $6, NOW(), $7)
 		ON CONFLICT (document_id) DO UPDATE SET
 			local_path = EXCLUDED.local_path,
 			cloudinary_url = EXCLUDED.cloudinary_url,
@@ -394,8 +442,9 @@ func createDocumentAndUploadJob(docID, userID, title, persona, fileHash, roomID,
 			next_run_at = NOW(),
 			error_code = NULL,
 			error_message = NULL,
+			image_paths = EXCLUDED.image_paths,
 			updated_at = NOW()`,
-		docID, userID, localPath, upload.SecureURL, upload.PublicID, uploadJobMaxAttempts); err != nil {
+		docID, userID, localPath, upload.SecureURL, upload.PublicID, uploadJobMaxAttempts, imagePaths); err != nil {
 		return err
 	}
 
@@ -415,10 +464,18 @@ func handleDuplicateDocument(c *gin.Context, doc existingDocument, roomID, userI
 		broadcastRoomLinked(roomID, userID, doc.ID)
 	}
 
+	// Giữ đúng is_owner: nếu user là người tạo tài liệu thì phải là owner.
+	// Dùng DO UPDATE thay DO NOTHING để restore ownership nếu user từng xóa rồi upload lại.
+	var isOwner bool
+	_ = config.DB.QueryRow(config.Ctx,
+		`SELECT user_id = $1 FROM documents WHERE id = $2`, userID, doc.ID,
+	).Scan(&isOwner)
+
 	if _, err := config.DB.Exec(config.Ctx, `
 		INSERT INTO document_references (user_id, document_id, is_owner, pinned)
-		VALUES ($1, $2, FALSE, FALSE)
-		ON CONFLICT (user_id, document_id) DO NOTHING`, userID, doc.ID); err != nil {
+		VALUES ($1, $2, $3, FALSE)
+		ON CONFLICT (user_id, document_id) DO UPDATE SET is_owner = EXCLUDED.is_owner`,
+		userID, doc.ID, isOwner); err != nil {
 		c.JSON(500, gin.H{"success": false, "error": "REFERENCE_CREATE_FAILED", "message": "Khong the them tai lieu vao thu vien"})
 		return
 	}
@@ -432,6 +489,17 @@ func handleDuplicateDocument(c *gin.Context, doc existingDocument, roomID, userI
 			"message":      "Tai lieu da ton tai, da duoc them vao thu vien cua ban.",
 		},
 	})
+}
+
+func restoreSoftDeletedDocument(c *gin.Context, doc existingDocument, roomID, userID string) {
+	if _, err := config.DB.Exec(config.Ctx,
+		`UPDATE documents SET deleted_at = NULL WHERE id = $1`, doc.ID,
+	); err != nil {
+		c.JSON(500, gin.H{"success": false, "error": "RESTORE_FAILED", "message": "Khong the khoi phuc tai lieu"})
+		return
+	}
+	// Tái dùng handleDuplicateDocument để link references + room đúng cách.
+	handleDuplicateDocument(c, doc, roomID, userID)
 }
 
 func linkDuplicateDocumentToRoom(roomID, userID, docID string) error {
@@ -580,4 +648,127 @@ func fallbackProgressFromDB(docID string) gin.H {
 		payload["error_code"] = *errorCode
 	}
 	return payload
+}
+
+func validateImageFileHeader(header *multipart.FileHeader, index int) error {
+	if header.Size > maxImageUploadSize {
+		return &uploadValidationError{
+			Status:  http.StatusRequestEntityTooLarge,
+			Code:    "IMAGE_TOO_LARGE",
+			Message: fmt.Sprintf("Anh thu %d vuot qua gioi han 5MB", index+1),
+		}
+	}
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".webp":
+	default:
+		return &uploadValidationError{
+			Status:  http.StatusUnsupportedMediaType,
+			Code:    "UNSUPPORTED_IMAGE_TYPE",
+			Message: fmt.Sprintf("Anh thu %d khong hop le: chi ho tro JPG, PNG, WEBP", index+1),
+		}
+	}
+
+	f, err := header.Open()
+	if err != nil {
+		return fmt.Errorf("khong the doc anh %d", index+1)
+	}
+	defer f.Close()
+
+	buf := make([]byte, 12)
+	n, _ := io.ReadFull(f, buf)
+	buf = buf[:n]
+
+	switch ext {
+	case ".jpg", ".jpeg":
+		if n < 3 || buf[0] != 0xFF || buf[1] != 0xD8 || buf[2] != 0xFF {
+			return &uploadValidationError{
+				Status:  http.StatusUnsupportedMediaType,
+				Code:    "INVALID_IMAGE_SIGNATURE",
+				Message: fmt.Sprintf("Anh thu %d khong phai JPEG hop le", index+1),
+			}
+		}
+	case ".png":
+		if n < 4 || string(buf[:4]) != "\x89PNG" {
+			return &uploadValidationError{
+				Status:  http.StatusUnsupportedMediaType,
+				Code:    "INVALID_IMAGE_SIGNATURE",
+				Message: fmt.Sprintf("Anh thu %d khong phai PNG hop le", index+1),
+			}
+		}
+	case ".webp":
+		if n < 12 || string(buf[:4]) != "RIFF" || string(buf[8:12]) != "WEBP" {
+			return &uploadValidationError{
+				Status:  http.StatusUnsupportedMediaType,
+				Code:    "INVALID_IMAGE_SIGNATURE",
+				Message: fmt.Sprintf("Anh thu %d khong phai WEBP hop le", index+1),
+			}
+		}
+	}
+
+	return nil
+}
+
+func saveUploadedImages(headers []*multipart.FileHeader, docID string) ([]string, error) {
+	if len(headers) == 0 {
+		return []string{}, nil
+	}
+	if len(headers) > maxImageCount {
+		return nil, &uploadValidationError{
+			Status:  http.StatusBadRequest,
+			Code:    "TOO_MANY_IMAGES",
+			Message: fmt.Sprintf("Toi da %d anh moi lan upload", maxImageCount),
+		}
+	}
+
+	uploadDir := "./tmp/uploads"
+	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+		return nil, err
+	}
+
+	var paths []string
+	for i, header := range headers {
+		if err := validateImageFileHeader(header, i); err != nil {
+			for _, p := range paths {
+				_ = os.Remove(p)
+			}
+			return nil, err
+		}
+
+		ext := strings.ToLower(filepath.Ext(header.Filename))
+		localPath := filepath.Join(uploadDir, fmt.Sprintf("%s-img-%d%s", docID, i, ext))
+
+		src, err := header.Open()
+		if err != nil {
+			for _, p := range paths {
+				_ = os.Remove(p)
+			}
+			return nil, err
+		}
+
+		dst, err := os.Create(localPath)
+		if err != nil {
+			src.Close()
+			for _, p := range paths {
+				_ = os.Remove(p)
+			}
+			return nil, err
+		}
+
+		_, copyErr := io.Copy(dst, src)
+		src.Close()
+		dst.Close()
+		if copyErr != nil {
+			_ = os.Remove(localPath)
+			for _, p := range paths {
+				_ = os.Remove(p)
+			}
+			return nil, copyErr
+		}
+
+		paths = append(paths, localPath)
+	}
+
+	return paths, nil
 }

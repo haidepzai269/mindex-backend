@@ -42,7 +42,7 @@ func (e *PipelineError) Unwrap() error {
 }
 
 func RunEmbeddingPipeline(job models.UploadJob) error {
-	utils.UpdateDocProgressDetail(job.DocID, "downloading", 10, "Dang doc file goc", "")
+	utils.UpdateDocProgressDetail(job.DocID, "downloading", 10, "Đang đọc file gốc", "")
 
 	localPath, cleanup, err := ensurePipelineFile(job)
 	if cleanup {
@@ -51,23 +51,43 @@ func RunEmbeddingPipeline(job models.UploadJob) error {
 		defer os.Remove(localPath)
 	}
 	if err != nil {
-		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Khong the doc file goc", "SOURCE_FILE_UNAVAILABLE")
-		return &PipelineError{Code: "SOURCE_FILE_UNAVAILABLE", Message: "Khong the doc file goc", Retryable: true, Err: err}
+		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Không thể đọc file gốc", "SOURCE_FILE_UNAVAILABLE")
+		return &PipelineError{Code: "SOURCE_FILE_UNAVAILABLE", Message: "Không thể đọc file gốc", Retryable: true, Err: err}
 	}
 
 	fileBytes, err := os.ReadFile(localPath)
 	if err != nil {
-		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Khong the doc file tam", "SOURCE_FILE_READ_FAILED")
-		return &PipelineError{Code: "SOURCE_FILE_READ_FAILED", Message: "Khong the doc file tam", Retryable: true, Err: err}
+		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Không thể đọc file tạm", "SOURCE_FILE_READ_FAILED")
+		return &PipelineError{Code: "SOURCE_FILE_READ_FAILED", Message: "Không thể đọc file tạm", Retryable: true, Err: err}
 	}
 	hash := fmt.Sprintf("%x", sha256.Sum256(fileBytes))
 	log.Printf("[Upload Pipeline] Read file for doc %s: %d bytes", job.DocID, len(fileBytes))
 
-	utils.UpdateDocProgressDetail(job.DocID, "extracting", 30, "Dang trich xuat noi dung", "")
+	utils.UpdateDocProgressDetail(job.DocID, "extracting", 30, "Đang trích xuất nội dung", "")
 	chunks, err := utils.ExtractAndChunk(localPath, utils.CleanTextLocal)
 	if err != nil {
-		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Khong the trich xuat noi dung", "EXTRACTION_FAILED")
-		return &PipelineError{Code: "EXTRACTION_FAILED", Message: "Khong the trich xuat noi dung", Retryable: false, Err: err}
+		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Không thể trích xuất nội dung", "EXTRACTION_FAILED")
+		return &PipelineError{Code: "EXTRACTION_FAILED", Message: "Không thể trích xuất nội dung", Retryable: false, Err: err}
+	}
+
+	if len(job.ImagePaths) > 0 {
+		utils.UpdateDocProgressDetail(job.DocID, "extracting", 33, "Đang OCR ảnh đính kèm", "")
+		for i, imgPath := range job.ImagePaths {
+			result, ocrErr := utils.RunImageOCR(imgPath)
+			_ = os.Remove(imgPath)
+			if ocrErr != nil {
+				log.Printf("[Upload Pipeline] OCR failed for image %d of doc %s: %v", i+1, job.DocID, ocrErr)
+				continue
+			}
+			if strings.TrimSpace(result.Text) == "" {
+				continue
+			}
+			chunks = append(chunks, utils.Chunk{
+				Content:          result.Text,
+				RetrievalContent: fmt.Sprintf("[Nội dung từ ảnh đính kèm %d]\n\n%s", i+1, result.Text),
+				PageStart:        0,
+			})
+		}
 	}
 
 	var cleanTextBuilder strings.Builder
@@ -77,13 +97,13 @@ func RunEmbeddingPipeline(job models.UploadJob) error {
 	cleanText := cleanTextBuilder.String()
 	log.Printf("[Upload Pipeline] Extracted %d chunks from doc %s", len(chunks), job.DocID)
 
-	utils.UpdateDocProgressDetail(job.DocID, "analyzing", 35, "Dang phan tich tong quan", "")
+	utils.UpdateDocProgressDetail(job.DocID, "analyzing", 35, "Đang phân tích tổng quan", "")
 	docIntel, intelErr := utils.AnalyzeDocument(job.DocID, cleanText)
 	if intelErr != nil {
 		log.Printf("[Upload Pipeline] Document intelligence warning for %s: %v", job.DocID, intelErr)
 	}
 
-	utils.UpdateDocProgressDetail(job.DocID, "moderating", 40, "Dang kiem duyet noi dung", "")
+	utils.UpdateDocProgressDetail(job.DocID, "moderating", 40, "Đang kiểm duyệt nội dung", "")
 	if passed, reason := utils.T1RuleBased(config.Ctx, hash, len(strings.Fields(cleanText)), len(cleanText), cleanText); !passed {
 		utils.SaveRejectedHash(config.Ctx, hash, reason)
 		return &PipelineError{Code: "MODERATION_T1_REJECTED", Message: reason, Retryable: false, Rejected: true}
@@ -104,15 +124,15 @@ func RunEmbeddingPipeline(job models.UploadJob) error {
 	}
 	log.Printf("[Upload Pipeline] Moderation passed. Subject: %s", subjectArea)
 
-	utils.UpdateDocProgressDetail(job.DocID, "classifying", 45, "Dang phan loai tai lieu", "")
+	utils.UpdateDocProgressDetail(job.DocID, "classifying", 45, "Đang phân loại tài liệu", "")
 	updateDetectedPersona(job.DocID, cleanText)
 
-	utils.UpdateDocProgressDetail(job.DocID, "embedding", 60, "Dang tao embedding", "")
+	utils.UpdateDocProgressDetail(job.DocID, "embedding", 60, "Đang tạo embedding", "")
 	if err := embedChunks(job, chunks, docIntel); err != nil {
 		return err
 	}
 
-	utils.UpdateDocProgressDetail(job.DocID, "ready", 100, "Tai lieu da san sang", "")
+	utils.UpdateDocProgressDetail(job.DocID, "ready", 100, "Tài liệu đã sẵn sàng", "")
 	_, _ = config.DB.Exec(config.Ctx, `
 		UPDATE documents
 		SET status='ready',
@@ -261,7 +281,7 @@ func embedChunks(job models.UploadJob, chunks []utils.Chunk, docIntel *utils.Doc
 
 			atomic.AddInt32(&completedChunks, 1)
 			p := 60 + int(float32(atomic.LoadInt32(&completedChunks))/float32(len(chunks))*35)
-			utils.UpdateDocProgressDetail(job.DocID, "embedding", p, "Dang tao embedding", "")
+			utils.UpdateDocProgressDetail(job.DocID, "embedding", p, "Đang tạo embedding", "")
 
 			vecStr := utils.FloatSliceToVectorString(vec)
 			_, err = config.DB.Exec(config.Ctx, `
@@ -279,7 +299,7 @@ func embedChunks(job models.UploadJob, chunks []utils.Chunk, docIntel *utils.Doc
 
 	if errCount > 0 {
 		_, _ = config.DB.Exec(config.Ctx, `DELETE FROM document_chunks WHERE document_id=$1`, job.DocID)
-		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Tao embedding that bai", "EMBEDDING_FAILED")
+		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Tạo embedding thất bại", "EMBEDDING_FAILED")
 		return &PipelineError{
 			Code:      "EMBEDDING_FAILED",
 			Message:   fmt.Sprintf("Embedding pipeline failed with %d chunk errors", errCount),

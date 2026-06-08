@@ -89,7 +89,8 @@ func claimNextUploadJob(workerID string) (models.UploadJob, bool, error) {
 			COALESCE(j.cloudinary_url, ''),
 			COALESCE(j.cloudinary_public_id, ''),
 			j.attempts,
-			j.max_attempts`,
+			j.max_attempts,
+			COALESCE(j.image_paths, '{}')`,
 		workerID,
 	).Scan(
 		&job.ID,
@@ -100,6 +101,7 @@ func claimNextUploadJob(workerID string) (models.UploadJob, bool, error) {
 		&job.CloudinaryPublicID,
 		&job.Attempts,
 		&job.MaxAttempts,
+		&job.ImagePaths,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return models.UploadJob{}, false, nil
@@ -144,8 +146,8 @@ func handleUploadJobFailure(workerID string, job models.UploadJob, err error) {
 			SET status='queued',
 				processing_error_code=$1,
 				processing_error_message=$2
-			WHERE id=$3`, pipelineErr.Code, fmt.Sprintf("Dang thu lai sau %s", delay), job.DocID)
-		utils.UpdateDocProgressDetail(job.DocID, "queued", 0, fmt.Sprintf("Dang thu lai sau %s", delay), pipelineErr.Code)
+			WHERE id=$3`, pipelineErr.Code, fmt.Sprintf("Đang thử lại sau %s", delay), job.DocID)
+		utils.UpdateDocProgressDetail(job.DocID, "queued", 0, fmt.Sprintf("Đang thử lại sau %s", delay), pipelineErr.Code)
 		signalRetry(job.DocID)
 		return
 	}

@@ -56,6 +56,7 @@ func CreateSharedLink(c *gin.Context) {
 	if len(fullMsgBytes) > 0 {
 		json.Unmarshal(fullMsgBytes, &messages)
 	}
+	messages = filterShareableSessionMessages(messages)
 
 	// Gọi LLM tóm tắt hội thoại (SYS-011 - chạy ngầm, không block response)
 	var summary string
@@ -147,7 +148,7 @@ func GetSharedLink(c *gin.Context) {
 	}
 
 	// Kiểm tra hết hạn
-	if expiredAt != nil && time.Now().After(*expiredAt) {
+	if expiredAt != nil && !time.Now().Before(*expiredAt) {
 		c.JSON(410, gin.H{"success": false, "error": "LINK_EXPIRED", "message": "Link chia sẻ đã hết hạn"})
 		return
 	}
@@ -165,29 +166,31 @@ func GetSharedLink(c *gin.Context) {
 	_ = config.DB.QueryRow(config.Ctx, `SELECT display_name FROM users WHERE id = $1`, creatorID).Scan(&creatorName)
 
 	// Lấy messages nếu show_history = true
-	var fullMessages []interface{}
+	fullMessages := []map[string]interface{}{}
 	if settings["show_history"] {
 		var fullMsgBytes []byte
+		var rawMessages []map[string]interface{}
 		_ = config.DB.QueryRow(config.Ctx, `
 			SELECT full_messages FROM chat_histories WHERE session_id = $1`, sessionID).Scan(&fullMsgBytes)
 		if len(fullMsgBytes) > 0 {
-			json.Unmarshal(fullMsgBytes, &fullMessages)
+			json.Unmarshal(fullMsgBytes, &rawMessages)
 		}
+		fullMessages = filterShareableSessionMessages(rawMessages)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data": gin.H{
-			"link_id":      linkID,
-			"document_id":  docID,
-			"session_id":   sessionID,
-			"document":     gin.H{"id": docID, "title": docTitle, "status": docStatus},
-			"creator":      gin.H{"display_name": creatorName},
-			"settings":     settings,
-			"summary":      summary,
-			"messages":     fullMessages,
-			"created_at":   createdAt,
-			"expired_at":   expiredAt,
+			"link_id":     linkID,
+			"document_id": docID,
+			"session_id":  sessionID,
+			"document":    gin.H{"id": docID, "title": docTitle, "status": docStatus},
+			"creator":     gin.H{"display_name": creatorName},
+			"settings":    settings,
+			"summary":     summary,
+			"messages":    fullMessages,
+			"created_at":  createdAt,
+			"expired_at":  expiredAt,
 		},
 	})
 }
@@ -208,4 +211,31 @@ func buildConversationText(messages []map[string]interface{}) string {
 		}
 	}
 	return text
+}
+
+func filterShareableSessionMessages(messages []map[string]interface{}) []map[string]interface{} {
+	filtered := make([]map[string]interface{}, 0, len(messages))
+	for _, msg := range messages {
+		if isSessionMessageDeleted(msg) {
+			continue
+		}
+
+		shared := gin.H{}
+		if id, ok := msg["id"].(string); ok {
+			shared["id"] = id
+		}
+		if role, ok := msg["role"].(string); ok {
+			shared["role"] = role
+		}
+		if content, ok := msg["content"].(string); ok {
+			shared["content"] = content
+		}
+		if timestamp, ok := msg["timestamp"].(string); ok {
+			shared["timestamp"] = timestamp
+		}
+		if len(shared) > 0 {
+			filtered = append(filtered, shared)
+		}
+	}
+	return filtered
 }

@@ -36,12 +36,13 @@ type DocumentChunk struct {
 }
 
 type UploadJob struct {
-	ID                 string `json:"id"`
-	DocID              string `json:"doc_id"`
-	LocalPath          string `json:"local_path"`
-	UserID             string `json:"user_id"`
-	CloudinaryURL      string `json:"cloudinary_url"`
-	CloudinaryPublicID string `json:"cloudinary_public_id"`
-	Attempts           int    `json:"attempts"`
-	MaxAttempts        int    `json:"max_attempts"`
+	ID                 string   `json:"id"`
+	DocID              string   `json:"doc_id"`
+	LocalPath          string   `json:"local_path"`
+	UserID             string   `json:"user_id"`
+	CloudinaryURL      string   `json:"cloudinary_url"`
+	CloudinaryPublicID string   `json:"cloudinary_public_id"`
+	Attempts           int      `json:"attempts"`
+	MaxAttempts        int      `json:"max_attempts"`
+	ImagePaths         []string `json:"image_paths"`
 }

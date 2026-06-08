@@ -23,14 +23,16 @@ const maxStoredChatMessages = 80
 const offTopicVectorSimThreshold = 0.50
 
 type ChatRequest struct {
-	DocumentID    string `json:"document_id"`
-	CollectionID  string `json:"collection_id"`
-	SessionID     string `json:"session_id"`
-	Question      string `json:"question" binding:"required"`
-	UseSystemDocs bool   `json:"use_system_docs"`
-	ForkID        string `json:"fork_id"` // ID của shared_link nếu đây là fork session
-	Model         string `json:"model"`   // Mindex-1 hoặc Mindex-2
-	Thinking      bool   `json:"thinking"`
+	DocumentID          string                   `json:"document_id"`
+	CollectionID        string                   `json:"collection_id"`
+	SessionID           string                   `json:"session_id"`
+	Question            string                   `json:"question" binding:"required"`
+	UseSystemDocs       bool                     `json:"use_system_docs"`
+	ForkID              string                   `json:"fork_id"` // ID của shared_link nếu đây là fork session
+	Model               string                   `json:"model"`   // Mindex-1 hoặc Mindex-2
+	Thinking            bool                     `json:"thinking"`
+	AttachmentIDs       []string                 `json:"attachment_ids"`
+	AttachmentOverrides []ChatAttachmentOverride `json:"attachment_overrides"`
 }
 
 type QAHistory struct {
@@ -213,11 +215,24 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 	}
 
 	// 0. Lưu tin nhắn của User vào PostgreSQL
+	chatAttachments, err := loadChatImageAttachmentsForPrompt(config.Ctx, userID, req.SessionID, req.AttachmentIDs, req.AttachmentOverrides)
+	if err != nil {
+		c.JSON(400, gin.H{"success": false, "error": "INVALID_ATTACHMENTS", "message": err.Error()})
+		return
+	}
+	hasImageAttachments := len(chatAttachments) > 0
+	imageOCRContext := buildChatImageOCRContext(chatAttachments)
+	historyQuestion := buildChatHistoryQuestion(req.Question, chatAttachments)
+
+	userMessageID := uuid.New().String()
 	userMsg := gin.H{
-		"id":        uuid.New().String(),
+		"id":        userMessageID,
 		"role":      "user",
 		"content":   req.Question,
 		"timestamp": time.Now().Format(time.RFC3339),
+	}
+	if hasImageAttachments {
+		userMsg["attachments"] = chatImageAttachmentsForMessage(chatAttachments)
 	}
 	userMsgBytes, _ := json.Marshal(userMsg)
 	userErr := appendChatHistoryMessage(config.Ctx, req.SessionID, string(userMsgBytes))
@@ -229,6 +244,10 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 	}
 
 	// 1. Setup SSE headers - Cực kỳ quan trọng cho Streaming
+	if userErr == nil && hasImageAttachments {
+		updateChatImageAttachmentMessageID(config.Ctx, userID, req.SessionID, userMessageID, chatAttachments)
+	}
+
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -240,6 +259,9 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		return
 	}
 	writeChatStatus(c, flusher, "thinking")
+	if hasImageAttachments {
+		writeChatInsight(c, flusher, fmt.Sprintf("Da nhan OCR tu %d anh dinh kem va se dung lam ngu canh bo sung.", len(chatAttachments)))
+	}
 	writeChatInsight(c, flusher, fmt.Sprintf("Đã nhận câu hỏi: \"%s\".", compactChatPreview(req.Question, 120)))
 
 	// [Phase C] Keyword pre-filter: bắt social messages rõ ràng trước mọi DB/Redis/API call
@@ -247,20 +269,20 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		log.Printf("⚡ [CHAT] Keyword pre-filter: sensitive content detected for session=%s q=%q", req.SessionID, req.Question)
 		sensitiveMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
 		sendHardcodedSSEResponse(c, flusher, req.SessionID, sensitiveMsg)
-		go saveHardcodedToHistory(req.SessionID, req.Question, sensitiveMsg)
+		go saveHardcodedToHistory(req.SessionID, historyQuestion, sensitiveMsg)
 		return
 	}
 
-	if isObviouslyOffTopic(req.Question) {
+	if isObviouslyOffTopic(req.Question) && !hasImageAttachments {
 		log.Printf("⚡ [CHAT] Keyword pre-filter: obvious off-topic for session=%s q=%q", req.SessionID, req.Question)
 		socialMsg := "Tôi chỉ hỗ trợ các câu hỏi liên quan đến nội dung tài liệu. Hãy thử hỏi về các khái niệm, định nghĩa hoặc thông tin được đề cập trong tài liệu bạn đang xem."
 		sendHardcodedSSEResponse(c, flusher, req.SessionID, socialMsg)
-		go saveHardcodedToHistory(req.SessionID, req.Question, socialMsg)
+		go saveHardcodedToHistory(req.SessionID, historyQuestion, socialMsg)
 		return
 	}
 
 	// [Cache Check] Kiểm tra answer cache trước mọi API call (chỉ cho non-thinking mode)
-	if !thinkingMode {
+	if !thinkingMode && !hasImageAttachments {
 		scopeID := req.DocumentID
 		if req.CollectionID != "" {
 			scopeID = req.CollectionID
@@ -270,7 +292,7 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 			log.Printf("🎯 [CHAT] Cache HIT session=%s scope=%s", req.SessionID, scopeID)
 			writeChatInsight(c, flusher, "Đã tìm thấy câu trả lời trong bộ nhớ đệm, trả về kết quả ngay lập tức.")
 			sendCachedSSEResponse(c, flusher, req.SessionID, cached)
-			go saveHardcodedToHistory(req.SessionID, req.Question, cached.Answer)
+			go saveHardcodedToHistory(req.SessionID, historyQuestion, cached.Answer)
 			return
 		}
 	}
@@ -311,15 +333,11 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 		writeChatInsight(c, flusher, "Đã tìm thấy lịch sử hội thoại, AI sẽ dùng nó để hiểu câu hỏi nối tiếp.")
 	}
 
-
-
 	// 3. Query Rewrite (SYS-023) - Làm rõ câu hỏi dựa trên lịch sử trước khi search
 	searchQuery := utils.RewriteQueryWithHistory(req.Question, historySummary)
 	if strings.TrimSpace(searchQuery) != "" && searchQuery != req.Question {
 		writeChatInsight(c, flusher, fmt.Sprintf("Đã diễn giải lại câu hỏi để tìm kiếm chính xác hơn: \"%s\".", compactChatPreview(searchQuery, 140)))
 	}
-
-
 
 	// 4. Vector Embed câu hỏi
 	writeChatInsight(c, flusher, "Đang tạo embedding để tìm các đoạn tài liệu liên quan.")
@@ -342,17 +360,23 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 	isOffTopic := len(searchResults) == 0 || maxVectorSim < offTopicVectorSimThreshold
 	if isOffTopic {
 		hasWebTrigger := config.Env.WebSearchEnabled && utils.WebSearchHeuristicTriggered(req.Question, searchQuery)
-		if !hasWebTrigger {
+		if !hasImageAttachments && !hasWebTrigger {
 			log.Printf("⚡ [CHAT] Off-topic short-circuit: results=%d, maxSim=%.4f, threshold=%.2f, session=%s", len(searchResults), maxVectorSim, offTopicVectorSimThreshold, req.SessionID)
 			offTopicMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
 			sendHardcodedSSEResponse(c, flusher, req.SessionID, offTopicMsg)
-			go saveHardcodedToHistory(req.SessionID, req.Question, offTopicMsg)
+			go saveHardcodedToHistory(req.SessionID, historyQuestion, offTopicMsg)
 			return
 		}
-		log.Printf("🌐 [CHAT] Off-topic but web trigger detected, allowing web search: maxSim=%.4f session=%s", maxVectorSim, req.SessionID)
-		writeChatInsight(c, flusher, "Nội dung không có trong tài liệu, sẽ thử tìm kiếm web để bổ sung.")
-	}
+		if hasImageAttachments {
+			log.Printf("[CHAT] Off-topic document score bypassed because image OCR context exists: maxSim=%.4f session=%s", maxVectorSim, req.SessionID)
+			writeChatInsight(c, flusher, "Cau hoi co anh dinh kem, bo qua chan off-topic theo tai lieu de doc OCR.")
+		}
+		if hasWebTrigger {
+			log.Printf("🌐 [CHAT] Off-topic but web trigger detected, allowing web search: maxSim=%.4f session=%s", maxVectorSim, req.SessionID)
+			writeChatInsight(c, flusher, "Nội dung không có trong tài liệu, sẽ thử tìm kiếm web để bổ sung.")
+		}
 
+	}
 	var contextText string
 	var sources []map[string]interface{}
 	for _, res := range searchResults {
@@ -372,6 +396,14 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 			"content":     res.RetrievalContent,
 			"doc_title":   res.DocTitle,
 		})
+	}
+
+	if imageOCRContext != "" {
+		if strings.TrimSpace(contextText) == "" {
+			contextText = imageOCRContext
+		} else {
+			contextText = imageOCRContext + "\n\n" + contextText
+		}
 	}
 
 	// 5. Build prompt & Call AI
@@ -476,7 +508,7 @@ User đã bật chế độ Thinking cho câu hỏi này. Hãy phân tích kỹ 
 	chatLatency := int(time.Since(chatStart).Milliseconds())
 
 	// [Cache Write] Lưu câu trả lời vào cache sau khi AI thành công (async, không block SSE)
-	if !thinkingMode && streamErr == nil && fullAnswer != "" {
+	if !thinkingMode && !hasImageAttachments && streamErr == nil && fullAnswer != "" {
 		scopeID := req.DocumentID
 		if req.CollectionID != "" {
 			scopeID = req.CollectionID
@@ -559,7 +591,7 @@ User đã bật chế độ Thinking cho câu hỏi này. Hãy phân tích kỹ 
 			// Redis (Short-term cache)
 			if config.RedisClient != nil {
 				historyKey := "session:" + req.SessionID
-				newQA := QAHistory{Question: req.Question, Answer: fullAnswer}
+				newQA := QAHistory{Question: historyQuestion, Answer: fullAnswer}
 				qaBytes, _ := json.Marshal(newQA)
 				config.RedisClient.RPush(context.Background(), historyKey, string(qaBytes))
 				config.RedisClient.LTrim(context.Background(), historyKey, -10, -1)

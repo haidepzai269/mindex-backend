@@ -1,13 +1,28 @@
 package controllers
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"mindex-backend/config"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
+
+const (
+	normalChatScope          = "document"
+	normalChatRedisTTL       = time.Hour
+	normalChatRedisPairLimit = 10
+	softDeletedAtField       = "deleted_at"
+)
+
+var errSessionMessageNotFound = errors.New("session message not found")
 
 // RenameSession đổi tên session
 // PATCH /chat/sessions/:session_id
@@ -83,21 +98,24 @@ func CreateSession(c *gin.Context) {
 // Hỗ trợ pagination: ?limit=30&skip=0
 //   - limit: số tin cần lấy (mặc định 0 = toàn bộ, backward-compat)
 //   - skip: bỏ qua N tin từ cuối (dùng khi load thêm tin cũ hơn)
+//
 // Response thêm: total (tổng số tin), has_more (còn tin cũ hơn không)
 func GetSessionMessages(c *gin.Context) {
 	sessionID := c.Param("session_id")
+	userID := c.GetString("user_id")
 	if sessionID == "" {
 		c.JSON(400, gin.H{"error": "MISSING_SESSION_ID"})
 		return
 	}
 
-	limit := parsePageInt(c.Query("limit"), 0, 0, 80)   // 0 = không paginate
+	limit := parsePageInt(c.Query("limit"), 0, 0, 80) // 0 = không paginate
 	skip := parsePageInt(c.Query("skip"), 0, 0, 10000)
 
 	var fullMessages []byte
 	err := config.DB.QueryRow(config.Ctx, `
 		SELECT full_messages FROM chat_histories
-		WHERE session_id = $1`, sessionID).Scan(&fullMessages)
+		WHERE session_id = $1 AND user_id = $2 AND chat_scope = $3`,
+		sessionID, userID, normalChatScope).Scan(&fullMessages)
 
 	if err != nil {
 		c.JSON(200, gin.H{
@@ -114,11 +132,13 @@ func GetSessionMessages(c *gin.Context) {
 
 	var allMessages []map[string]interface{}
 	if len(fullMessages) > 0 {
-		json.Unmarshal(fullMessages, &allMessages)
+		if err := json.Unmarshal(fullMessages, &allMessages); err != nil {
+			log.Printf("❌ [Session] Failed to decode session history %s: %v", sessionID, err)
+			allMessages = []map[string]interface{}{}
+		}
 	}
 
-	// Hydrate log_id cho tất cả messages trước khi paginate
-	userID := c.GetString("user_id")
+	// Hydrate log_id cho tất cả assistant messages active trước khi paginate
 	allMessages = hydrateLogIDs(allMessages, sessionID, userID)
 
 	total := len(allMessages)
@@ -147,19 +167,300 @@ func GetSessionMessages(c *gin.Context) {
 		"success": true,
 		"data": gin.H{
 			"session_id": sessionID,
-			"messages":   paged,
+			"messages":   serializeSessionMessages(paged),
 			"total":      total,
 			"has_more":   hasMore,
 		},
 	})
 }
 
-// hydrateLogIDs đảm bảo mỗi assistant message có log_id, ghi lại DB nếu thiếu.
+// DeleteMessage xóa mềm một tin nhắn trong session thường của user.
+// DELETE /chat/sessions/:session_id/messages/:message_id
+func DeleteMessage(c *gin.Context) {
+	mutateSessionMessageState(c, false)
+}
+
+// RestoreMessage khôi phục một tin nhắn đã soft delete trong session thường của user.
+// POST /chat/sessions/:session_id/messages/:message_id/restore
+func RestoreMessage(c *gin.Context) {
+	mutateSessionMessageState(c, true)
+}
+
+func mutateSessionMessageState(c *gin.Context, restore bool) {
+	sessionID := c.Param("session_id")
+	messageID := c.Param("message_id")
+	userID := c.GetString("user_id")
+	if sessionID == "" || messageID == "" {
+		c.JSON(400, gin.H{"success": false, "error": "MISSING_MESSAGE_ID", "message": "Thiếu session_id hoặc message_id"})
+		return
+	}
+
+	message, err := updateNormalChatMessageState(c.Request.Context(), sessionID, userID, messageID, restore)
+	if err != nil {
+		switch {
+		case errors.Is(err, pgx.ErrNoRows), errors.Is(err, errSessionMessageNotFound):
+			c.JSON(404, gin.H{"success": false, "message": "Không tìm thấy tin nhắn"})
+		default:
+			log.Printf("❌ [Session] Failed to mutate message %s in session %s: %v", messageID, sessionID, err)
+			c.JSON(500, gin.H{"success": false, "message": "Không thể cập nhật tin nhắn"})
+		}
+		return
+	}
+
+	successMessage := "Đã xóa tin nhắn"
+	if restore {
+		successMessage = "Đã khôi phục tin nhắn"
+	}
+
+	c.JSON(200, gin.H{
+		"success": true,
+		"message": successMessage,
+		"data": gin.H{
+			"session_id": sessionID,
+			"message":    message,
+		},
+	})
+}
+
+func updateNormalChatMessageState(ctx context.Context, sessionID, userID, messageID string, restore bool) (map[string]interface{}, error) {
+	tx, err := config.DB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	messages, err := loadNormalChatMessagesForUpdate(ctx, tx, sessionID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	messageIndex := findSessionMessageIndex(messages, messageID)
+	if messageIndex < 0 {
+		return nil, errSessionMessageNotFound
+	}
+
+	if restore {
+		delete(messages[messageIndex], softDeletedAtField)
+	} else if !isSessionMessageDeleted(messages[messageIndex]) {
+		messages[messageIndex][softDeletedAtField] = time.Now().UTC().Format(time.RFC3339)
+	}
+
+	newBytes, err := json.Marshal(messages)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = tx.Exec(ctx, `
+		UPDATE chat_histories
+		SET full_messages = $1
+		WHERE session_id = $2 AND user_id = $3 AND chat_scope = $4`,
+		newBytes, sessionID, userID, normalChatScope)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE shared_links
+		SET expired_at = NOW()
+		WHERE session_id = $1 AND (expired_at IS NULL OR expired_at > NOW())`,
+		sessionID); err != nil {
+		return nil, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	rebuildNormalChatRedisHistory(sessionID, messages)
+	return serializeSessionMessage(messages[messageIndex]), nil
+}
+
+func loadNormalChatMessagesForUpdate(ctx context.Context, tx pgx.Tx, sessionID, userID string) ([]map[string]interface{}, error) {
+	var fullMessages []byte
+	err := tx.QueryRow(ctx, `
+		SELECT full_messages FROM chat_histories
+		WHERE session_id = $1 AND user_id = $2 AND chat_scope = $3
+		FOR UPDATE`,
+		sessionID, userID, normalChatScope).Scan(&fullMessages)
+	if err != nil {
+		return nil, err
+	}
+
+	var messages []map[string]interface{}
+	if len(fullMessages) == 0 {
+		return messages, nil
+	}
+	if err := json.Unmarshal(fullMessages, &messages); err != nil {
+		return nil, err
+	}
+	return messages, nil
+}
+
+func findSessionMessageIndex(messages []map[string]interface{}, messageID string) int {
+	for i, msg := range messages {
+		if id, _ := msg["id"].(string); id == messageID {
+			return i
+		}
+	}
+	return -1
+}
+
+func rebuildNormalChatRedisHistory(sessionID string, messages []map[string]interface{}) {
+	if config.RedisClient == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	historyKey := "session:" + sessionID
+	if err := config.RedisClient.Del(ctx, historyKey).Err(); err != nil {
+		log.Printf("⚠️ [Session] Failed to clear Redis history for %s: %v", sessionID, err)
+	}
+
+	history := buildNormalChatRedisHistory(messages)
+	if len(history) == 0 {
+		return
+	}
+
+	pipe := config.RedisClient.Pipeline()
+	for _, qa := range history {
+		qaBytes, err := json.Marshal(qa)
+		if err != nil {
+			log.Printf("⚠️ [Session] Failed to marshal Redis history item for %s: %v", sessionID, err)
+			continue
+		}
+		pipe.RPush(ctx, historyKey, string(qaBytes))
+	}
+	pipe.LTrim(ctx, historyKey, -normalChatRedisPairLimit, -1)
+	pipe.Expire(ctx, historyKey, normalChatRedisTTL)
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.Printf("⚠️ [Session] Failed to rebuild Redis history for %s: %v", sessionID, err)
+		if delErr := config.RedisClient.Del(ctx, historyKey).Err(); delErr != nil {
+			log.Printf("⚠️ [Session] Failed to clear stale Redis history for %s: %v", sessionID, delErr)
+		}
+	}
+}
+
+// buildNormalChatRedisHistory rebuild prompt history only from intact user -> assistant exchanges.
+func buildNormalChatRedisHistory(messages []map[string]interface{}) []QAHistory {
+	history := make([]QAHistory, 0, normalChatRedisPairLimit)
+	pendingQuestion := ""
+
+	for _, msg := range messages {
+		role, _ := msg["role"].(string)
+		if role == "" {
+			continue
+		}
+
+		if isSessionMessageDeleted(msg) {
+			if role == "user" || role == "assistant" {
+				pendingQuestion = ""
+			}
+			continue
+		}
+
+		content, _ := msg["content"].(string)
+		if content == "" {
+			continue
+		}
+
+		switch role {
+		case "user":
+			pendingQuestion = sessionMessageQuestionForHistory(msg, content)
+		case "assistant":
+			if pendingQuestion == "" {
+				continue
+			}
+			history = append(history, QAHistory{Question: pendingQuestion, Answer: content})
+			pendingQuestion = ""
+		}
+	}
+
+	if len(history) > normalChatRedisPairLimit {
+		history = history[len(history)-normalChatRedisPairLimit:]
+	}
+	return history
+}
+
+func sessionMessageQuestionForHistory(msg map[string]interface{}, content string) string {
+	rawAttachments, ok := msg["attachments"].([]interface{})
+	if !ok || len(rawAttachments) == 0 {
+		return content
+	}
+
+	previews := make([]string, 0, len(rawAttachments))
+	for i, raw := range rawAttachments {
+		att, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		preview, _ := att["ocr_text"].(string)
+		if strings.TrimSpace(preview) == "" {
+			preview, _ = att["ocr_preview"].(string)
+		}
+		preview = strings.TrimSpace(preview)
+		if preview == "" {
+			preview = "(no OCR text)"
+		}
+		previews = append(previews, compactChatPreview("Image "+strconv.Itoa(i+1)+" OCR: "+preview, 500))
+	}
+	if len(previews) == 0 {
+		return content
+	}
+	return strings.TrimSpace(content + "\n" + strings.Join(previews, "\n"))
+}
+
+func serializeSessionMessages(messages []map[string]interface{}) []map[string]interface{} {
+	serialized := make([]map[string]interface{}, 0, len(messages))
+	for _, msg := range messages {
+		serialized = append(serialized, serializeSessionMessage(msg))
+	}
+	return serialized
+}
+
+func serializeSessionMessage(msg map[string]interface{}) map[string]interface{} {
+	if isSessionMessageDeleted(msg) {
+		tombstone := gin.H{
+			"is_deleted": true,
+		}
+		if id, ok := msg["id"].(string); ok {
+			tombstone["id"] = id
+		}
+		if role, ok := msg["role"].(string); ok {
+			tombstone["role"] = role
+		}
+		if timestamp, ok := msg["timestamp"].(string); ok {
+			tombstone["timestamp"] = timestamp
+		}
+		if deletedAt, ok := msg[softDeletedAtField].(string); ok {
+			tombstone["deleted_at"] = deletedAt
+		}
+		return tombstone
+	}
+
+	active := make(map[string]interface{}, len(msg)+1)
+	for key, value := range msg {
+		if key == softDeletedAtField {
+			continue
+		}
+		active[key] = value
+	}
+	active["is_deleted"] = false
+	return active
+}
+
+func isSessionMessageDeleted(msg map[string]interface{}) bool {
+	deletedAt, ok := msg[softDeletedAtField].(string)
+	return ok && deletedAt != ""
+}
+
+// hydrateLogIDs đảm bảo mỗi assistant message active có log_id, ghi lại DB nếu thiếu.
 func hydrateLogIDs(messages []map[string]interface{}, sessionID, userID string) []map[string]interface{} {
 	changed := false
 	for i, msg := range messages {
 		role, ok := msg["role"].(string)
-		if !ok || role != "assistant" {
+		if !ok || role != "assistant" || isSessionMessageDeleted(msg) {
 			continue
 		}
 		if _, has := msg["log_id"]; has {
@@ -188,7 +489,10 @@ func hydrateLogIDs(messages []map[string]interface{}, sessionID, userID string) 
 	if changed {
 		if newBytes, err := json.Marshal(messages); err == nil {
 			_, updateErr := config.DB.Exec(config.Ctx, `
-				UPDATE chat_histories SET full_messages = $1 WHERE session_id = $2`, newBytes, sessionID)
+				UPDATE chat_histories
+				SET full_messages = $1
+				WHERE session_id = $2 AND user_id = $3 AND chat_scope = $4`,
+				newBytes, sessionID, userID, normalChatScope)
 			if updateErr != nil {
 				log.Printf("❌ [LegacyLog] Failed to update chat history: %v", updateErr)
 			}

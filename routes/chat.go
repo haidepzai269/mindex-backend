@@ -17,7 +17,10 @@ func RegisterChatRoutes(rg *gin.RouterGroup) {
 	chat.PATCH("/sessions/:session_id", controllers.RenameSession)
 	chat.DELETE("/sessions/:session_id", controllers.DeleteSession)
 	chat.GET("/sessions/:session_id/messages", controllers.GetSessionMessages)
+	chat.DELETE("/sessions/:session_id/messages/:message_id", middleware.RateLimit("chat_message_mutation", 60, time.Minute), controllers.DeleteMessage)
+	chat.POST("/sessions/:session_id/messages/:message_id/restore", middleware.RateLimit("chat_message_mutation", 60, time.Minute), controllers.RestoreMessage)
 	chat.GET("/sessions/active/:doc_id", controllers.GetActiveSession)
+	chat.POST("/attachments/image", middleware.RateLimit("chat_image_upload", 20, time.Minute), controllers.UploadChatImageAttachment)
 
 	// AI endpoints bị giới hạn 30 req/phút per user
 	ai := chat.Group("/ai")
