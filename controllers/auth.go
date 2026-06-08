@@ -234,24 +234,37 @@ func Refresh(c *gin.Context) {
 		return
 	}
 
-	access, _, _ := utils.GenerateTokenPair(claims.UserID, claims.Role, claims.Persona)
+	// Chặn reuse: kiểm tra refresh token JTI đã bị blacklist chưa
+	if config.RedisClient != nil {
+		blacklisted, _ := config.RedisClient.Exists(config.Ctx, "blacklist:"+claims.ID).Result()
+		if blacklisted > 0 {
+			c.JSON(401, gin.H{"success": false, "error": "TOKEN_REUSE_DETECTED", "message": "Token đã được sử dụng"})
+			return
+		}
+	}
 
-	// Cập nhật access token mới vào cookie theo chuẩn Secure/SameSite
-	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     "access_token",
-		Value:    access,
-		MaxAge:   900,
-		Path:     "/",
-		Domain:   "",
-		Secure:   true,
-		HttpOnly: true,
-		SameSite: http.SameSiteNoneMode,
-	})
+	// Rotate: tạo cả access và refresh token mới
+	access, newRefresh, err := utils.GenerateTokenPair(claims.UserID, claims.Role, claims.Persona)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "error": "TOKEN_GENERATION_FAILED", "message": "Không thể tạo token mới"})
+		return
+	}
+
+	// Blacklist refresh token cũ với TTL còn lại của nó
+	if config.RedisClient != nil {
+		if ttl := time.Until(claims.ExpiresAt.Time); ttl > 0 {
+			config.RedisClient.Set(config.Ctx, "blacklist:"+claims.ID, "1", ttl)
+		}
+	}
+
+	// Set cả hai cookie mới
+	setTokenCookies(c, access, newRefresh, false)
 
 	c.JSON(200, gin.H{
 		"success": true,
 		"data": gin.H{
-			"access_token": access,
+			"access_token":  access,
+			"refresh_token": newRefresh,
 		},
 	})
 }
