@@ -20,6 +20,6 @@ func RegisterFeedbackRoutes(rg *gin.RouterGroup) {
 		feedback.GET("/rating/:log_id", controllers.GetRatingByLogID)
 	}
 
-	// WebSocket route (Public because token is in query)
-	rg.GET("/ws/feedback", controllers.ServeFeedbackWS)
+	// WebSocket route uses cookie/header auth from AuthMiddleware.
+	rg.GET("/ws/feedback", middleware.AuthMiddleware(), controllers.ServeFeedbackWS)
 }

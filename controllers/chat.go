@@ -20,7 +20,8 @@ const maxStoredChatMessages = 80
 
 // offTopicVectorSimThreshold: câu hỏi bị coi là off-topic nếu cosine similarity
 // tốt nhất thấp hơn ngưỡng này. Data thực tế: on-topic ~0.51, off-topic ~0.48.
-const offTopicVectorSimThreshold = 0.50
+// Hạ xuống 0.46 để tạo buffer đủ xa biên off-topic sau khi đã strip social noise.
+const offTopicVectorSimThreshold = 0.46
 
 type ChatRequest struct {
 	DocumentID          string                   `json:"document_id"`
@@ -275,9 +276,8 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 
 	if isObviouslyOffTopic(req.Question) && !hasImageAttachments {
 		log.Printf("⚡ [CHAT] Keyword pre-filter: obvious off-topic for session=%s q=%q", req.SessionID, req.Question)
-		socialMsg := "Tôi chỉ hỗ trợ các câu hỏi liên quan đến nội dung tài liệu. Hãy thử hỏi về các khái niệm, định nghĩa hoặc thông tin được đề cập trong tài liệu bạn đang xem."
-		sendHardcodedSSEResponse(c, flusher, req.SessionID, socialMsg)
-		go saveHardcodedToHistory(req.SessionID, historyQuestion, socialMsg)
+		reply := sendSoftRejectSSE(c, flusher, req.SessionID, req.Question, targetTitle)
+		go saveHardcodedToHistory(req.SessionID, historyQuestion, reply)
 		return
 	}
 
@@ -334,14 +334,35 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 	}
 
 	// 3. Query Rewrite (SYS-023) - Làm rõ câu hỏi dựa trên lịch sử trước khi search
-	searchQuery := utils.RewriteQueryWithHistory(req.Question, historySummary)
+	// Strip social noise trước — chỉ dùng cho embedding/search, không thay req.Question gốc.
+	cleanQuestion := utils.StripSocialLeadin(req.Question)
+	searchQuery := utils.RewriteQueryWithHistory(cleanQuestion, historySummary)
 	if strings.TrimSpace(searchQuery) != "" && searchQuery != req.Question {
 		writeChatInsight(c, flusher, fmt.Sprintf("Đã diễn giải lại câu hỏi để tìm kiếm chính xác hơn: \"%s\".", compactChatPreview(searchQuery, 140)))
 	}
 
-	// 4. Vector Embed câu hỏi
+	// Intent classification (Fix 6) — zero LLM, thuần heuristic
+	intent := utils.ClassifyIntent(req.Question, historySummary)
+	log.Printf("🎯 [CHAT] Intent=%s session=%s", intent, req.SessionID)
+	switch intent {
+	case utils.IntentConversational:
+		writeChatInsight(c, flusher, "Đã nhận câu hỏi kèm tiền tố hội thoại, xử lý phần câu hỏi thực.")
+	case utils.IntentTangential:
+		writeChatInsight(c, flusher, "Câu hỏi là follow-up trong phiên — tìm kiếm có tham chiếu lịch sử.")
+	}
+
+	// 4. Vector Embed — chiến lược thay đổi theo intent
+	// IntentOpinion → HyDE (Fix 5): embed "câu trả lời giả" thay vì câu hỏi trực tiếp
+	// để đưa queryVec về "answer space" gần với document chunk embeddings hơn.
+	// BM25 vẫn dùng searchQuery (keyword-based, không benefit từ HyDE).
+	embedSource := searchQuery
+	if intent == utils.IntentOpinion {
+		writeChatInsight(c, flusher, "Câu hỏi dạng ý kiến/đánh giá — đang tạo ngữ cảnh tài liệu giả để tìm kiếm chính xác hơn (HyDE).")
+		embedSource = utils.GenerateHyDE(searchQuery)
+	}
+
 	writeChatInsight(c, flusher, "Đang tạo embedding để tìm các đoạn tài liệu liên quan.")
-	queryVec, err := utils.GeminiEmbedPool.EmbedWithRetry(searchQuery, utils.CallGeminiAPI)
+	queryVec, err := utils.GeminiEmbedPool.EmbedWithRetry(embedSource, utils.CallGeminiAPI)
 	if err != nil {
 		fmt.Fprintf(c.Writer, "event: error\ndata: {\"error\": \"EMBEDDING_FAILED\"}\n\n")
 		flusher.Flush()
@@ -349,23 +370,67 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 	}
 
 	// 5. Hybrid Search (Vector + BM25)
-	log.Printf("🔍 [CHAT] Performing Hybrid Search for session: %s (Query: %s)", req.SessionID, searchQuery)
+	// queryVec: từ HyDE nếu IntentOpinion, từ searchQuery nếu không
+	// searchQuery: luôn là clean query gốc cho BM25 keyword matching
+	log.Printf("🔍 [CHAT] Performing Hybrid Search for session: %s (Query: %s, Intent: %s)", req.SessionID, searchQuery, intent)
 	searchResults, maxVectorSim, _ := utils.HybridSearch(req.DocumentID, req.CollectionID, searchQuery, queryVec, 8)
 	log.Printf("🎯 [CHAT] Hybrid Search done: results=%d, maxVectorSim=%.4f, session=%s", len(searchResults), maxVectorSim, req.SessionID)
 	writeChatInsight(c, flusher, fmt.Sprintf("Hybrid search tìm thấy %d đoạn ứng viên trong tài liệu.", len(searchResults)))
+
+	// Fix 7: Session topic vector check — trước mọi off-topic judgment
+	// Tải topic vector của phiên từ Redis, tính cosine sim với queryVec.
+	// Nếu cao → câu hỏi khớp với chủ đề session dù không khớp document chunk cụ thể.
+	simToTopic := utils.GetSessionTopicSim(context.Background(), req.SessionID, queryVec)
+	if simToTopic > 0 {
+		log.Printf("🗺️ [CHAT] Session topic sim=%.4f session=%s", simToTopic, req.SessionID)
+	}
 
 	// Short-circuit: off-topic theo similarity threshold
 	// Ngoại lệ: nếu câu hỏi có heuristic web trigger (giá, luật, thời sự...)
 	// → vẫn cho tiếp tục để web search có cơ hội trả lời
 	isOffTopic := len(searchResults) == 0 || maxVectorSim < offTopicVectorSimThreshold
+
+	// Session topic bypass (Fix 7): câu hỏi không khớp doc nhưng khớp chủ đề session
+	if isOffTopic && simToTopic >= utils.TopicSimBypassThreshold {
+		isOffTopic = false
+		log.Printf("🗺️ [CHAT] Topic-vec bypass: simToTopic=%.4f >= %.2f, session=%s", simToTopic, utils.TopicSimBypassThreshold, req.SessionID)
+		writeChatInsight(c, flusher, fmt.Sprintf("Câu hỏi liên quan đến chủ đề phiên hội thoại (sim=%.2f) — tiếp tục xử lý.", simToTopic))
+	}
+
+	// History-aware bypass: câu hỏi borderline (0.40–threshold) trong phiên đang có lịch sử
+	// → không block vì khả năng cao là follow-up hợp lệ về cùng chủ đề
+	if isOffTopic && historySummary != "" && maxVectorSim >= 0.40 {
+		isOffTopic = false
+		log.Printf("🔄 [CHAT] History-aware bypass: maxSim=%.4f (borderline), session has history → continuing, session=%s", maxVectorSim, req.SessionID)
+		writeChatInsight(c, flusher, "Câu hỏi có độ tương đồng thấp nhưng phiên hội thoại đang có lịch sử liên quan, tiếp tục xử lý.")
+	}
+
+	// flexRuleInjection: thêm vào systemPrompt sau SYS-013 khi dùng soft fallback
+	var flexRuleInjection string
+
 	if isOffTopic {
 		hasWebTrigger := config.Env.WebSearchEnabled && utils.WebSearchHeuristicTriggered(req.Question, searchQuery)
 		if !hasImageAttachments && !hasWebTrigger {
-			log.Printf("⚡ [CHAT] Off-topic short-circuit: results=%d, maxSim=%.4f, threshold=%.2f, session=%s", len(searchResults), maxVectorSim, offTopicVectorSimThreshold, req.SessionID)
-			offTopicMsg := "Xin lỗi, tôi không tìm thấy nội dung liên quan đến câu hỏi này trong tài liệu. Hãy thử hỏi về các nội dung được đề cập trong tài liệu."
-			sendHardcodedSSEResponse(c, flusher, req.SessionID, offTopicMsg)
-			go saveHardcodedToHistory(req.SessionID, historyQuestion, offTopicMsg)
-			return
+			if historySummary != "" {
+				// Phiên đang có lịch sử nhưng sim < 0.40 → soft fallback thay vì hard block
+				// AI được dùng kiến thức chung có liên quan, ghi rõ nguồn gốc
+				log.Printf("🟡 [CHAT] Soft fallback (has history, sim=%.4f < 0.40): session=%s", maxVectorSim, req.SessionID)
+				writeChatInsight(c, flusher, "Không tìm thấy nội dung khớp trong tài liệu, AI sẽ trả lời dựa trên kiến thức chung có liên quan.")
+				flexRuleInjection = `
+
+[FLEX RESPONSE RULE]
+Câu hỏi hiện tại không có nội dung khớp trong tài liệu (similarity thấp).
+Bạn ĐƯỢC PHÉP dùng kiến thức chung để trả lời NẾU câu hỏi liên quan đến chủ đề tài liệu hoặc chủ đề đang thảo luận.
+Khi dùng kiến thức ngoài tài liệu, thêm chú thích "(Kiến thức chung)" ở cuối đoạn đó.
+Tuyệt đối không bịa số trang, không hallucinate trích dẫn.
+Nếu hoàn toàn không liên quan, lịch sự giải thích phạm vi hỗ trợ.`
+			} else {
+				// Phiên mới, không có history → soft reject với AI-generated response
+				log.Printf("⚡ [CHAT] Off-topic short-circuit: results=%d, maxSim=%.4f, threshold=%.2f, session=%s", len(searchResults), maxVectorSim, offTopicVectorSimThreshold, req.SessionID)
+				reply := sendSoftRejectSSE(c, flusher, req.SessionID, req.Question, targetTitle)
+				go saveHardcodedToHistory(req.SessionID, historyQuestion, reply)
+				return
+			}
 		}
 		if hasImageAttachments {
 			log.Printf("[CHAT] Off-topic document score bypassed because image OCR context exists: maxSim=%.4f session=%s", maxVectorSim, req.SessionID)
@@ -375,8 +440,10 @@ Hãy nhận thức được ngữ cảnh này nhưng KHÔNG lặp lại nó. T�
 			log.Printf("🌐 [CHAT] Off-topic but web trigger detected, allowing web search: maxSim=%.4f session=%s", maxVectorSim, req.SessionID)
 			writeChatInsight(c, flusher, "Nội dung không có trong tài liệu, sẽ thử tìm kiếm web để bổ sung.")
 		}
-
 	}
+	// Fix 7: Cập nhật session topic vector async — chỉ sau khi câu hỏi pass off-topic check
+	go utils.UpdateSessionTopicVec(context.Background(), req.SessionID, queryVec)
+
 	var contextText string
 	var sources []map[string]interface{}
 	for _, res := range searchResults {
@@ -489,6 +556,10 @@ User đã bật chế độ Thinking cho câu hỏi này. Hãy phân tích kỹ 
 			systemPrompt = "Xin lỗi, tôi không tìm thấy dữ liệu trong tài liệu gốc. Có vẻ như tài liệu đã bị xóa hoặc hết hạn."
 		}
 		log.Printf("⚠️ [CHAT] No context found. Using SYS-013 fallback prompt.")
+	}
+	// Append flex rule sau SYS-013 để không bị overwrite
+	if flexRuleInjection != "" {
+		systemPrompt += flexRuleInjection
 	}
 
 	finalPrompt := buildRAGPrompt(systemPrompt, historySummary, contextText, req.Question)
@@ -734,6 +805,43 @@ func sendHardcodedSSEResponse(c *gin.Context, flusher http.Flusher, sessionID, m
 	})
 	fmt.Fprintf(c.Writer, "event: done\ndata: %s\n\n", string(donePayload))
 	flusher.Flush()
+}
+
+// sendSoftRejectSSE gọi AI để tạo câu từ chối thân thiện, có ngữ cảnh tài liệu,
+// thay vì trả về chuỗi hardcoded. Fallback về chuỗi mặc định nếu AI không khả dụng.
+// Trả về nội dung đã stream để caller có thể lưu vào history.
+func sendSoftRejectSSE(c *gin.Context, flusher http.Flusher, sessionID, question, docTitle string) string {
+	const fallback = "Tôi chỉ có thể hỗ trợ các câu hỏi liên quan đến nội dung tài liệu. Bạn có muốn hỏi về nội dung này không?"
+
+	title := strings.TrimSpace(docTitle)
+	if title == "" {
+		title = "tài liệu hiện tại"
+	}
+
+	var reply string
+	if utils.AI != nil {
+		sysPrompt := fmt.Sprintf(`Bạn là Mindex AI, trợ lý học tập đang hỗ trợ tài liệu "%s".
+Người dùng vừa gửi tin nhắn nằm ngoài phạm vi tài liệu.
+Trả lời đúng 1-2 câu: từ chối nhẹ nhàng, không cứng nhắc, gợi ý hướng câu hỏi phù hợp về tài liệu.
+Không lặp lại câu hỏi của user. Tone thân thiện, tự nhiên.`, title)
+
+		msgs := []utils.ChatMessage{
+			{Role: "system", Content: sysPrompt},
+			{Role: "user", Content: question},
+		}
+		r, _, err := utils.AI.ChatNonStream(utils.ServiceSearch, msgs)
+		if err == nil && strings.TrimSpace(r) != "" {
+			reply = strings.TrimSpace(r)
+		} else {
+			log.Printf("⚠️ [SoftReject] AI failed: %v. Using fallback.", err)
+		}
+	}
+	if reply == "" {
+		reply = fallback
+	}
+
+	sendHardcodedSSEResponse(c, flusher, sessionID, reply)
+	return reply
 }
 
 func sendCachedSSEResponse(c *gin.Context, flusher http.Flusher, sessionID string, cached *utils.CachedAnswer) {

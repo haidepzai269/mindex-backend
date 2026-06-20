@@ -16,7 +16,12 @@ import (
 func RateLimit(key string, limit int, window time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if config.RedisClient == nil {
-			c.Next()
+			c.JSON(503, gin.H{
+				"success": false,
+				"error":   "AUTH_STATE_UNAVAILABLE",
+				"message": "Dịch vụ tạm thời không khả dụng.",
+			})
+			c.Abort()
 			return
 		}
 

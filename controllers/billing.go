@@ -222,11 +222,21 @@ func PayOSWebhook(c *gin.Context) {
 	}
 
 	var userID, pkg, status string
+	var dbAmount int
 	err := config.DB.QueryRow(config.Ctx,
-		"SELECT user_id, package_name, status FROM payments WHERE order_code = $1",
-		orderCode).Scan(&userID, &pkg, &status)
+		"SELECT user_id, package_name, status, amount FROM payments WHERE order_code = $1",
+		orderCode).Scan(&userID, &pkg, &status, &dbAmount)
 	if err != nil || status == "PAID" {
 		c.JSON(200, gin.H{"message": "ok"})
+		return
+	}
+
+	// Verify amount từ webhook khớp với DB để chống tampering
+	webhookAmountFloat, _ := body.Data["amount"].(float64)
+	webhookAmount := int(webhookAmountFloat)
+	if webhookAmount > 0 && webhookAmount != dbAmount {
+		log.Printf("[PayOS Webhook] ⚠️ Amount mismatch! orderCode=%d db=%d webhook=%d user=%s", orderCode, dbAmount, webhookAmount, userID)
+		c.JSON(400, gin.H{"error": "amount mismatch"})
 		return
 	}
 

@@ -140,7 +140,8 @@ func GetDocumentDetail(c *gin.Context) {
 		FROM documents d
 		LEFT JOIN document_references dr ON d.id = dr.document_id AND dr.user_id = $2
 		WHERE d.id = $1
-		  AND (d.expired_at IS NULL OR d.expired_at > NOW())`,
+		  AND (d.expired_at IS NULL OR d.expired_at > NOW())
+		  AND (dr.user_id IS NOT NULL OR d.is_public = TRUE)`,
 		docID, userID,
 	).Scan(
 		&d.ID,

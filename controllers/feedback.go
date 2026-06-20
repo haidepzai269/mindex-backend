@@ -6,7 +6,6 @@ import (
 	"log"
 	"mindex-backend/config"
 	"mindex-backend/internal/ws"
-	"mindex-backend/utils"
 	"net/http"
 	"time"
 
@@ -18,7 +17,7 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true // Cần điều chỉnh theo CORS thực tế của bạn
+		return config.IsAllowedOrigin(r.Header.Get("Origin"))
 	},
 }
 
@@ -43,7 +42,7 @@ func CreateFeedbackSession(c *gin.Context) {
 	defer tx.Rollback(config.Ctx)
 
 	var sessionID string
-	err = tx.QueryRow(config.Ctx, 
+	err = tx.QueryRow(config.Ctx,
 		`INSERT INTO feedback_sessions (user_id, subject) VALUES ($1, $2) RETURNING id`,
 		userID, req.Subject).Scan(&sessionID)
 	if err != nil {
@@ -149,7 +148,7 @@ func GetFeedbackMessages(c *gin.Context) {
 		}
 	}
 
-	rows, err := config.DB.Query(config.Ctx, 
+	rows, err := config.DB.Query(config.Ctx,
 		`SELECT m.id, m.sender_id, m.role, m.content, m.created_at, u.name as sender_name
 		 FROM feedback_messages m
 		 JOIN users u ON m.sender_id = u.id
@@ -179,23 +178,9 @@ func GetFeedbackMessages(c *gin.Context) {
 
 // ServeFeedbackWS xử lý kết nối WebSocket
 func ServeFeedbackWS(c *gin.Context) {
-	token := c.Query("token")
-	if token == "" {
-		// Fallback: Thử lấy từ cookie
-		cookieToken, err := c.Cookie("access_token")
-		if err == nil {
-			token = cookieToken
-		}
-	}
-
-	if token == "" {
-		c.JSON(401, gin.H{"error": "Token missing"})
-		return
-	}
-
-	claims, err := utils.VerifyToken(token, false)
-	if err != nil {
-		c.JSON(401, gin.H{"error": "Invalid token"})
+	userID := c.GetString("user_id")
+	if userID == "" {
+		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
@@ -206,11 +191,11 @@ func ServeFeedbackWS(c *gin.Context) {
 	}
 
 	client := &ws.Client{
-		Hub:    ws.GlobalHub,
-		Conn:   conn,
-		UserID: claims.UserID,
-		IsAdmin: claims.Role == "admin",
-		Send:   make(chan []byte, 256),
+		Hub:     ws.GlobalHub,
+		Conn:    conn,
+		UserID:  userID,
+		IsAdmin: c.GetString("role") == "admin",
+		Send:    make(chan []byte, 256),
 	}
 
 	client.Hub.Register <- client
@@ -300,7 +285,7 @@ func handleIncomingChat(c *ws.Client, sessionID string, content string) {
 		var sessionUserID string
 		config.DB.QueryRow(context.Background(), `SELECT user_id FROM feedback_sessions WHERE id = $1`, sessionID).Scan(&sessionUserID)
 		ws.GlobalHub.SendToUser(sessionUserID, msgPayload)
-		
+
 		// Cũng thông báo cho các admin khác đang xem
 		ws.GlobalHub.SendToAdmins(msgPayload)
 	}

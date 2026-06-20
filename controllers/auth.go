@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/bcrypt"
 	"google.golang.org/api/idtoken"
 )
@@ -102,6 +103,11 @@ func Register(c *gin.Context) {
 		return
 	}
 
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
+
 	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
 	if err != nil {
 		c.JSON(500, gin.H{"success": false, "error": "INTERNAL_ERROR", "message": "Không thể xử lý mật khẩu"})
@@ -133,11 +139,27 @@ func Register(c *gin.Context) {
 	}
 
 	// Cập nhật Bloom Filter
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
+
+	access, refresh, refreshJTI, err := utils.GenerateTokenPair(userID, "user", personaVal, false)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "error": "TOKEN_GENERATION_FAILED", "message": "Không thể tạo phiên đăng nhập"})
+		return
+	}
+	if setErr := config.RedisClient.Set(config.Ctx, "refresh_active:"+refreshJTI, userID, 7*24*time.Hour).Err(); setErr != nil {
+		log.Printf("[Auth] Register: failed to store refresh JTI: %v", setErr)
+		if _, delErr := config.DB.Exec(config.Ctx, "DELETE FROM users WHERE id = $1", userID); delErr != nil {
+			log.Printf("[Auth] Register: failed to rollback user %s after refresh JTI store failure: %v", userID, delErr)
+		}
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
 	if utils.EmailBloom != nil {
 		utils.EmailBloom.Add(req.Email)
 	}
-
-	access, refresh, _ := utils.GenerateTokenPair(userID, "user", personaVal)
 	log.Printf("[AUDIT] REGISTER user_id=%s email=%s ip=%s", userID, req.Email, c.ClientIP())
 
 	setTokenCookies(c, access, refresh, false)
@@ -181,16 +203,26 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	access, refresh, _ := utils.GenerateTokenPair(user.ID, user.Role, user.Persona)
-	log.Printf("[AUDIT] LOGIN_SUCCESS user_id=%s email=%s ip=%s", user.ID, user.Email, c.ClientIP())
-
-	// Xử lý Redis Session nếu chọn Remember Me
-	if req.RememberMe && config.RedisClient != nil {
-		// Lưu session vào Redis với TTL 10 ngày
-		// Key: session:<user_id>, Value: refresh_token (để verify nếu cần)
-		sessionKey := fmt.Sprintf("session:%s", user.ID)
-		config.RedisClient.Set(config.Ctx, sessionKey, refresh, 10*24*time.Hour)
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
 	}
+
+	access, refresh, refreshJTI, err := utils.GenerateTokenPair(user.ID, user.Role, user.Persona, req.RememberMe)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "error": "TOKEN_GENERATION_FAILED", "message": "Không thể tạo phiên đăng nhập"})
+		return
+	}
+	refreshTTL := 7 * 24 * time.Hour
+	if req.RememberMe {
+		refreshTTL = 10 * 24 * time.Hour
+	}
+	if setErr := config.RedisClient.Set(config.Ctx, "refresh_active:"+refreshJTI, user.ID, refreshTTL).Err(); setErr != nil {
+		log.Printf("[Auth] Login: failed to store refresh JTI: %v", setErr)
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
+	log.Printf("[AUDIT] LOGIN_SUCCESS user_id=%s email=%s ip=%s", user.ID, user.Email, c.ClientIP())
 
 	setTokenCookies(c, access, refresh, req.RememberMe)
 
@@ -218,10 +250,10 @@ func Refresh(c *gin.Context) {
 	var req struct {
 		RefreshToken string `json:"refresh_token"`
 	}
-	
+
 	// Thử bind JSON trước
 	c.ShouldBindJSON(&req)
-	
+
 	refreshToken := req.RefreshToken
 	// Nếu body trống, thử lấy từ cookie
 	if refreshToken == "" {
@@ -242,31 +274,90 @@ func Refresh(c *gin.Context) {
 		return
 	}
 
+	// Redis bắt buộc: cần để kiểm tra blacklist và revoke_before
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
+
 	// Chặn reuse: kiểm tra refresh token JTI đã bị blacklist chưa
-	if config.RedisClient != nil {
-		blacklisted, _ := config.RedisClient.Exists(config.Ctx, "blacklist:"+claims.ID).Result()
-		if blacklisted > 0 {
-			c.JSON(401, gin.H{"success": false, "error": "TOKEN_REUSE_DETECTED", "message": "Token đã được sử dụng"})
+	blacklisted, err := config.RedisClient.Exists(config.Ctx, "blacklist:"+claims.ID).Result()
+	if err != nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
+	if blacklisted > 0 {
+		c.JSON(401, gin.H{"success": false, "error": "TOKEN_REUSE_DETECTED", "message": "Token đã được sử dụng"})
+		return
+	}
+
+	// Chặn token cũ sau khi đổi/reset mật khẩu
+	revokeAt, revokeErr := config.RedisClient.Get(config.Ctx, "revoke_before:"+claims.UserID).Int64()
+	if revokeErr != nil && revokeErr != redis.Nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
+		return
+	}
+	if revokeErr == nil {
+		if claims.IssuedAt.Unix() < revokeAt {
+			c.JSON(401, gin.H{"success": false, "error": "TOKEN_REVOKED", "message": "Phiên đăng nhập đã bị thu hồi, vui lòng đăng nhập lại"})
 			return
 		}
 	}
 
+	// Kiểm tra JTI có trong whitelist active không
+	activeUserID, err := config.RedisClient.Get(config.Ctx, "refresh_active:"+claims.ID).Result()
+	if err != nil && err != redis.Nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
+		return
+	}
+	if err == redis.Nil || activeUserID != claims.UserID {
+		c.JSON(401, gin.H{"success": false, "error": "TOKEN_REVOKED", "message": "Phiên đăng nhập không hợp lệ, vui lòng đăng nhập lại"})
+		return
+	}
+
 	// Rotate: tạo cả access và refresh token mới
-	access, newRefresh, err := utils.GenerateTokenPair(claims.UserID, claims.Role, claims.Persona)
+	// Phát hiện rememberMe từ TTL gốc: nếu token ban đầu > 8 ngày thì là remember_me=true
+	rememberMe := !claims.IssuedAt.IsZero() && !claims.ExpiresAt.IsZero() &&
+		claims.ExpiresAt.Sub(claims.IssuedAt.Time) > 8*24*time.Hour
+
+	access, newRefresh, newRefreshJTI, err := utils.GenerateTokenPair(claims.UserID, claims.Role, claims.Persona, rememberMe)
 	if err != nil {
 		c.JSON(500, gin.H{"success": false, "error": "TOKEN_GENERATION_FAILED", "message": "Không thể tạo token mới"})
 		return
 	}
 
-	// Blacklist refresh token cũ với TTL còn lại của nó
-	if config.RedisClient != nil {
-		if ttl := time.Until(claims.ExpiresAt.Time); ttl > 0 {
-			config.RedisClient.Set(config.Ctx, "blacklist:"+claims.ID, "1", ttl)
-		}
+	// Lưu JTI mới vào whitelist trước khi revoke cái cũ
+	newRefreshTTL := 7 * 24 * time.Hour
+	if rememberMe {
+		newRefreshTTL = 10 * 24 * time.Hour
+	}
+	if setErr := config.RedisClient.Set(config.Ctx, "refresh_active:"+newRefreshJTI, claims.UserID, newRefreshTTL).Err(); setErr != nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
 	}
 
-	// Set cả hai cookie mới
-	setTokenCookies(c, access, newRefresh, false)
+	// Revoke token cũ: blacklist + xóa khỏi whitelist
+	if ttl := time.Until(claims.ExpiresAt.Time); ttl > 0 {
+		if setErr := config.RedisClient.Set(config.Ctx, "blacklist:"+claims.ID, "1", ttl).Err(); setErr != nil {
+			log.Printf("[Auth] Refresh: failed to blacklist old refresh JTI %s: %v", claims.ID, setErr)
+			if delErr := config.RedisClient.Del(config.Ctx, "refresh_active:"+newRefreshJTI).Err(); delErr != nil {
+				log.Printf("[Auth] Refresh: failed to rollback new refresh JTI %s: %v", newRefreshJTI, delErr)
+			}
+			c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
+			return
+		}
+	}
+	if delErr := config.RedisClient.Del(config.Ctx, "refresh_active:"+claims.ID).Err(); delErr != nil {
+		log.Printf("[Auth] Refresh: failed to delete old refresh JTI %s: %v", claims.ID, delErr)
+		if rollbackErr := config.RedisClient.Del(config.Ctx, "refresh_active:"+newRefreshJTI).Err(); rollbackErr != nil {
+			log.Printf("[Auth] Refresh: failed to rollback new refresh JTI %s: %v", newRefreshJTI, rollbackErr)
+		}
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
+		return
+	}
+
+	// Set cả hai cookie mới, giữ nguyên rememberMe preference
+	setTokenCookies(c, access, newRefresh, rememberMe)
 
 	c.JSON(200, gin.H{
 		"success": true,
@@ -482,20 +573,26 @@ func ChangePassword(c *gin.Context) {
 		return
 	}
 
-	// 1. Kiểm tra OTP từ Redis
-	if config.RedisClient != nil {
-		cacheKey := fmt.Sprintf("otp:password:%s", userID)
-		storedOTP, err := config.RedisClient.Get(config.Ctx, cacheKey).Result()
-		if err != nil || storedOTP != req.OTPCode {
-			c.JSON(400, gin.H{"success": false, "error": "INVALID_OTP", "message": "Mã xác thực không chính xác hoặc đã hết hạn"})
-			return
-		}
-		// Xóa OTP sau khi dùng
-		config.RedisClient.Del(config.Ctx, cacheKey)
+	// 1. Redis bắt buộc để xác thực OTP
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
+
+	cacheKey := fmt.Sprintf("otp:password:%s", userID)
+	storedOTP, err := config.RedisClient.Get(config.Ctx, cacheKey).Result()
+	if err != nil || storedOTP != req.OTPCode {
+		c.JSON(400, gin.H{"success": false, "error": "INVALID_OTP", "message": "Mã xác thực không chính xác hoặc đã hết hạn"})
+		return
+	}
+	if delErr := config.RedisClient.Del(config.Ctx, cacheKey).Err(); delErr != nil {
+		log.Printf("[Auth] ChangePassword: failed to delete OTP for user %s: %v", userID, delErr)
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
+		return
 	}
 
 	var hashedOld string
-	err := config.DB.QueryRow(config.Ctx, "SELECT password_hash FROM users WHERE id = $1", userID).Scan(&hashedOld)
+	err = config.DB.QueryRow(config.Ctx, "SELECT password_hash FROM users WHERE id = $1", userID).Scan(&hashedOld)
 	if err != nil {
 		c.JSON(500, gin.H{"success": false, "message": "Lỗi hệ thống"})
 		return
@@ -517,9 +614,14 @@ func ChangePassword(c *gin.Context) {
 		return
 	}
 
-	// Xóa cache (mặc dù chỉ chứa profile nhưng cẩn thận vẫn tốt)
-	if config.RedisClient != nil {
-		config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID))
+	// Thu hồi tất cả refresh token cũ và xóa cache profile
+	if setErr := config.RedisClient.Set(config.Ctx, "revoke_before:"+userID, time.Now().Unix(), 10*24*time.Hour).Err(); setErr != nil {
+		log.Printf("[Auth] ChangePassword: failed to set revoke_before for user %s: %v", userID, setErr)
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
+		return
+	}
+	if delErr := config.RedisClient.Del(config.Ctx, fmt.Sprintf("user:profile:%s", userID)).Err(); delErr != nil {
+		log.Printf("[Auth] ChangePassword: failed to clear profile cache for user %s: %v", userID, delErr)
 	}
 
 	log.Printf("[AUDIT] PASSWORD_CHANGE user_id=%s ip=%s", userID, c.ClientIP())
@@ -530,7 +632,11 @@ func ChangePassword(c *gin.Context) {
 func SendPasswordOTP(c *gin.Context) {
 	userID := c.GetString("user_id")
 
-	// Lấy email của user
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
+
 	var email string
 	err := config.DB.QueryRow(config.Ctx, "SELECT email FROM users WHERE id = $1", userID).Scan(&email)
 	if err != nil {
@@ -539,14 +645,13 @@ func SendPasswordOTP(c *gin.Context) {
 	}
 
 	otp := generateOTP()
-
-	// Lưu vào Redis (5 phút)
-	if config.RedisClient != nil {
-		cacheKey := fmt.Sprintf("otp:password:%s", userID)
-		config.RedisClient.Set(config.Ctx, cacheKey, otp, 5*time.Minute)
+	cacheKey := fmt.Sprintf("otp:password:%s", userID)
+	if setErr := config.RedisClient.Set(config.Ctx, cacheKey, otp, 5*time.Minute).Err(); setErr != nil {
+		log.Printf("[Auth] SendPasswordOTP: failed to store OTP: %v", setErr)
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
 	}
 
-	// Gửi Email
 	err = utils.SendOTPEmail(email, otp, "Đổi mật khẩu")
 	if err != nil {
 		c.JSON(500, gin.H{"success": false, "message": "Không thể gửi email xác thực"})
@@ -566,6 +671,11 @@ func ForgotPasswordSendOTP(c *gin.Context) {
 		return
 	}
 
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ gửi mã xác thực tạm thời không khả dụng"})
+		return
+	}
+
 	// Luôn trả về 200 cùng message dù email tồn tại hay không (chống account enumeration).
 	// OTP chỉ được tạo và gửi nếu email thực sự tồn tại.
 	var userID string
@@ -573,9 +683,11 @@ func ForgotPasswordSendOTP(c *gin.Context) {
 
 	if exists {
 		otp := generateOTP()
-		if config.RedisClient != nil {
-			cacheKey := fmt.Sprintf("otp:reset:%s", req.Email)
-			config.RedisClient.Set(config.Ctx, cacheKey, otp, 5*time.Minute)
+		cacheKey := fmt.Sprintf("otp:reset:%s", req.Email)
+		if setErr := config.RedisClient.Set(config.Ctx, cacheKey, otp, 5*time.Minute).Err(); setErr != nil {
+			log.Printf("[Auth] ForgotPassword: failed to store OTP for %s: %v", req.Email, setErr)
+			c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
+			return
 		}
 		if err := utils.SendOTPEmail(req.Email, otp, "Khôi phục mật khẩu"); err != nil {
 			log.Printf("[Auth] ForgotPassword: failed to send OTP to %s: %v", req.Email, err)
@@ -597,16 +709,35 @@ func ResetPassword(c *gin.Context) {
 		return
 	}
 
-	// 1. Kiểm tra OTP từ Redis
-	if config.RedisClient != nil {
-		cacheKey := fmt.Sprintf("otp:reset:%s", req.Email)
-		storedOTP, err := config.RedisClient.Get(config.Ctx, cacheKey).Result()
-		if err != nil || storedOTP != req.OTPCode {
-			c.JSON(400, gin.H{"success": false, "message": "Mã xác thực không chính xác hoặc đã hết hạn"})
-			return
-		}
-		// Xóa OTP
-		config.RedisClient.Del(config.Ctx, cacheKey)
+	// 1. Redis bắt buộc để xác thực OTP
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
+
+	// Chống brute-force OTP: lock sau 5 lần sai
+	failKey := fmt.Sprintf("otp:fail:%s", req.Email)
+	failCount, _ := config.RedisClient.Get(config.Ctx, failKey).Int()
+	if failCount >= 5 {
+		c.JSON(429, gin.H{"success": false, "error": "OTP_LOCKED", "message": "Quá nhiều lần thử sai. Vui lòng yêu cầu mã mới sau 15 phút."})
+		return
+	}
+
+	otpKey := fmt.Sprintf("otp:reset:%s", req.Email)
+	storedOTP, err := config.RedisClient.Get(config.Ctx, otpKey).Result()
+	if err != nil || storedOTP != req.OTPCode {
+		config.RedisClient.Incr(config.Ctx, failKey)
+		config.RedisClient.Expire(config.Ctx, failKey, 15*time.Minute)
+		c.JSON(400, gin.H{"success": false, "message": "Mã xác thực không chính xác hoặc đã hết hạn"})
+		return
+	}
+
+	// OTP đúng — xóa OTP + xóa bộ đếm fail
+	config.RedisClient.Del(config.Ctx, failKey)
+	if delErr := config.RedisClient.Del(config.Ctx, otpKey).Err(); delErr != nil {
+		log.Printf("[Auth] ResetPassword: failed to delete OTP for %s: %v", req.Email, delErr)
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
+		return
 	}
 
 	// 2. Hash mật khẩu mới
@@ -616,10 +747,22 @@ func ResetPassword(c *gin.Context) {
 		return
 	}
 
-	// 3. Cập nhật DB
-	_, err = config.DB.Exec(config.Ctx, "UPDATE users SET password_hash = $1 WHERE email = $2", string(hashed), req.Email)
+	// 3. Cập nhật DB, lấy user_id để thu hồi token
+	var userID string
+	err = config.DB.QueryRow(
+		config.Ctx,
+		"UPDATE users SET password_hash = $1 WHERE email = $2 RETURNING id",
+		string(hashed), req.Email,
+	).Scan(&userID)
 	if err != nil {
 		c.JSON(500, gin.H{"success": false, "message": "Không thể cập nhật mật khẩu"})
+		return
+	}
+
+	// 4. Thu hồi tất cả refresh token cũ
+	if setErr := config.RedisClient.Set(config.Ctx, "revoke_before:"+userID, time.Now().Unix(), 10*24*time.Hour).Err(); setErr != nil {
+		log.Printf("[AUDIT] PASSWORD_RESET_REVOKE_FAILED user_id=%s email=%s ip=%s err=%v", userID, req.Email, c.ClientIP(), setErr)
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
 		return
 	}
 
@@ -628,21 +771,11 @@ func ResetPassword(c *gin.Context) {
 }
 
 func Logout(c *gin.Context) {
-	// 1. Phân tích token ID và thời gian hết hạn từ context (set bởi middleware)
+	userID := c.GetString("user_id")
 	tokenID := c.GetString("token_id")
 	tokenExp := c.GetInt64("token_exp")
 
-	// 2. Nếu có Redis, đưa token này vào Blacklist cho đến khi nó tự hết hạn
-	if tokenID != "" && config.RedisClient != nil {
-		now := time.Now().Unix()
-		remaining := tokenExp - now
-		if remaining > 0 {
-			// TTL = thời gian còn lại của token + 1 phút trừ hao
-			config.RedisClient.Set(config.Ctx, "blacklist:"+tokenID, "logged_out", time.Duration(remaining+60)*time.Second)
-		}
-	}
-
-	// 3. Xóa cookie bằng cách set MaxAge = -1
+	// 1. Luôn xóa cookie phía client
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     "access_token",
 		Value:    "",
@@ -662,17 +795,58 @@ func Logout(c *gin.Context) {
 		SameSite: http.SameSiteNoneMode,
 	})
 
-	// 4. Xóa session trong Redis nếu có
-	userID := c.GetString("user_id")
-	if userID != "" && config.RedisClient != nil {
-		config.RedisClient.Del(config.Ctx, fmt.Sprintf("session:%s", userID))
+	// 2. Redis bắt buộc để revoke token server-side
+	if config.RedisClient == nil {
+		log.Printf("[AUDIT] LOGOUT_PARTIAL user_id=%s ip=%s (Redis unavailable, cookies cleared)", userID, c.ClientIP())
+		c.JSON(503, gin.H{
+			"success": false,
+			"error":   "AUTH_STATE_UNAVAILABLE",
+			"message": "Đã xóa cookie nhưng không thể vô hiệu hóa phiên server. Vui lòng thử lại.",
+		})
+		return
+	}
+
+	// 3. Revoke access token
+	if tokenID != "" {
+		now := time.Now().Unix()
+		if remaining := tokenExp - now; remaining > 0 {
+			if setErr := config.RedisClient.Set(config.Ctx, "blacklist:"+tokenID, "logged_out", time.Duration(remaining+60)*time.Second).Err(); setErr != nil {
+				log.Printf("[Auth] Logout: failed to blacklist access JTI %s: %v", tokenID, setErr)
+				c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Server session revoke failed"})
+				return
+			}
+		}
+	}
+
+	// 4. Revoke refresh token + xóa khỏi whitelist
+	if refreshCookie, err := c.Cookie("refresh_token"); err == nil && refreshCookie != "" {
+		if refreshClaims, err := utils.VerifyToken(refreshCookie, true); err == nil {
+			if ttl := time.Until(refreshClaims.ExpiresAt.Time); ttl > 0 {
+				if setErr := config.RedisClient.Set(config.Ctx, "blacklist:"+refreshClaims.ID, "logged_out", ttl+60*time.Second).Err(); setErr != nil {
+					log.Printf("[Auth] Logout: failed to blacklist refresh JTI %s: %v", refreshClaims.ID, setErr)
+					c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Server session revoke failed"})
+					return
+				}
+			}
+			if delErr := config.RedisClient.Del(config.Ctx, "refresh_active:"+refreshClaims.ID).Err(); delErr != nil {
+				log.Printf("[Auth] Logout: failed to delete refresh JTI %s: %v", refreshClaims.ID, delErr)
+				c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Server session revoke failed"})
+				return
+			}
+		}
+	}
+
+	// 5. Xóa legacy session key
+	if userID != "" {
+		if delErr := config.RedisClient.Del(config.Ctx, fmt.Sprintf("session:%s", userID)).Err(); delErr != nil {
+			log.Printf("[Auth] Logout: failed to delete legacy session for user %s: %v", userID, delErr)
+			c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Server session revoke failed"})
+			return
+		}
 	}
 	log.Printf("[AUDIT] LOGOUT user_id=%s ip=%s", userID, c.ClientIP())
 
-	c.JSON(200, gin.H{
-		"success": true,
-		"message": "Đã đăng xuất và vô hiệu hóa phiên làm việc",
-	})
+	c.JSON(200, gin.H{"success": true, "message": "Đã đăng xuất và vô hiệu hóa phiên làm việc"})
 }
 
 type GoogleLoginReq struct {
@@ -688,9 +862,16 @@ func GoogleLogin(c *gin.Context) {
 	}
 
 	// 1. Thử xác thực ID Token với Google trước
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Authentication service unavailable"})
+		return
+	}
+
 	clientID := config.Env.GoogleClientID
 	if clientID == "" {
-		clientID = "610711552000-nlnnovm60gf63bscps5tklsjbub8pdv6.apps.googleusercontent.com"
+		log.Printf("[Auth] GoogleLogin: GOOGLE_CLIENT_ID not configured")
+		c.JSON(500, gin.H{"success": false, "error": "CONFIG_ERROR", "message": "Dịch vụ đăng nhập Google chưa được cấu hình"})
+		return
 	}
 
 	var email, name, googleID, avatarURL string
@@ -698,12 +879,22 @@ func GoogleLogin(c *gin.Context) {
 
 	if err != nil {
 		// FALLBACK: Thử coi req.Token là Access Token và gọi UserInfo API
-		resp, httpErr := http.Get("https://www.googleapis.com/oauth2/v3/userinfo?access_token=" + req.Token)
-		if httpErr != nil || resp.StatusCode != 200 {
+		userInfoReq, httpErr := http.NewRequestWithContext(config.Ctx, http.MethodGet, "https://www.googleapis.com/oauth2/v3/userinfo", nil)
+		if httpErr != nil {
+			c.JSON(401, gin.H{"success": false, "error": "INVALID_TOKEN", "message": "Token Google không hợp lệ hoặc đã hết hạn"})
+			return
+		}
+		userInfoReq.Header.Set("Authorization", "Bearer "+req.Token)
+		resp, httpErr := http.DefaultClient.Do(userInfoReq)
+		if httpErr != nil {
 			c.JSON(401, gin.H{"success": false, "error": "INVALID_TOKEN", "message": "Token Google không hợp lệ hoặc đã hết hạn"})
 			return
 		}
 		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			c.JSON(401, gin.H{"success": false, "error": "INVALID_TOKEN", "message": "Token Google không hợp lệ hoặc đã hết hạn"})
+			return
+		}
 		body, _ := ioutil.ReadAll(resp.Body)
 		var userInfo map[string]interface{}
 		if err := json.Unmarshal(body, &userInfo); err != nil {
@@ -714,7 +905,7 @@ func GoogleLogin(c *gin.Context) {
 		email, _ = userInfo["email"].(string)
 		name, _ = userInfo["name"].(string)
 		googleID, _ = userInfo["sub"].(string)
-		
+
 		if email == "" || googleID == "" {
 			fmt.Printf("[Google Auth Error] Missing required fields: email=%s, sub=%s\n", email, googleID)
 			c.JSON(401, gin.H{"success": false, "error": "INVALID_TOKEN", "message": "Thông tin từ Google không đầy đủ"})
@@ -736,6 +927,7 @@ func GoogleLogin(c *gin.Context) {
 
 	// 2. Tìm user trong DB
 	var user models.User
+	createdUser := false
 	err = config.DB.QueryRow(config.Ctx, `
 		SELECT id, email, name, COALESCE(google_id, ''), COALESCE(role, 'user'), persona, persona_set, COALESCE(bio, ''), COALESCE(urls, '[]'), COALESCE(avatar_url, '')
 		FROM users WHERE email = $1`,
@@ -769,29 +961,54 @@ func GoogleLogin(c *gin.Context) {
 		user.Persona = personaVal
 		user.PersonaSet = personaSet
 		user.AvatarURL = avatarURL
+		createdUser = true
 	} else {
 		// TRƯỜNG HỢP: User đã tồn tại
 		if user.GoogleID == "" {
 			// Nếu người dùng đang ở trang REGISTER mà email đã tồn tại -> Báo lỗi
 			if req.Intent == "register" {
 				c.JSON(409, gin.H{
-					"success": false, 
-					"error": "ACCOUNT_EXISTS", 
+					"success": false,
+					"error":   "ACCOUNT_EXISTS",
 					"message": "Tài khoản đã có, vui lòng đăng nhập",
 				})
 				return
 			}
 			// Nếu người dùng đang ở trang LOGIN -> Tự động liên kết và cho qua
-			_, _ = config.DB.Exec(config.Ctx, "UPDATE users SET google_id = $1 WHERE id = $2", googleID, user.ID)
+			if _, err := config.DB.Exec(config.Ctx, "UPDATE users SET google_id = $1 WHERE id = $2", googleID, user.ID); err != nil {
+				c.JSON(500, gin.H{"success": false, "message": "Failed to link Google account"})
+				return
+			}
 			user.GoogleID = googleID
 		} else if user.GoogleID != googleID {
 			// Cập nhật Google ID (nếu thay đổi sub của google - hiếm gặp)
-			_, _ = config.DB.Exec(config.Ctx, "UPDATE users SET google_id = $1 WHERE id = $2", googleID, user.ID)
+			if _, err := config.DB.Exec(config.Ctx, "UPDATE users SET google_id = $1 WHERE id = $2", googleID, user.ID); err != nil {
+				c.JSON(500, gin.H{"success": false, "message": "Failed to update Google account"})
+				return
+			}
 		}
 	}
 
 	// 3. Tạo JWT & Set Cookie
-	access, refresh, _ := utils.GenerateTokenPair(user.ID, user.Role, user.Persona)
+	if config.RedisClient == nil {
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
+	access, refresh, refreshJTI, err := utils.GenerateTokenPair(user.ID, user.Role, user.Persona, true)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "error": "TOKEN_GENERATION_FAILED", "message": "Không thể tạo phiên đăng nhập"})
+		return
+	}
+	if setErr := config.RedisClient.Set(config.Ctx, "refresh_active:"+refreshJTI, user.ID, 10*24*time.Hour).Err(); setErr != nil {
+		log.Printf("[Auth] GoogleLogin: failed to store refresh JTI: %v", setErr)
+		if createdUser {
+			if _, delErr := config.DB.Exec(config.Ctx, "DELETE FROM users WHERE id = $1", user.ID); delErr != nil {
+				log.Printf("[Auth] GoogleLogin: failed to rollback user %s after refresh JTI store failure: %v", user.ID, delErr)
+			}
+		}
+		c.JSON(503, gin.H{"success": false, "error": "AUTH_STATE_UNAVAILABLE", "message": "Dịch vụ xác thực tạm thời không khả dụng"})
+		return
+	}
 	log.Printf("[AUDIT] GOOGLE_LOGIN user_id=%s email=%s ip=%s", user.ID, user.Email, c.ClientIP())
 	setTokenCookies(c, access, refresh, true)
 
@@ -820,29 +1037,7 @@ func CheckEmail(c *gin.Context) {
 		return
 	}
 
-	// 1. Kiểm tra Bloom Filter (Cực nhanh)
-	if utils.EmailBloom != nil {
-		exists := utils.EmailBloom.Test(email)
-		if !exists {
-			// Nếu Bloom bảo chắc chắn không có -> Available
-			c.JSON(200, gin.H{"success": true, "data": gin.H{"available": true, "method": "bloom"}})
-			return
-		}
-	}
-
-	// 2. Nếu Bloom bảo "có thể có" -> Check DB để xác nhận (Phòng trường hợp False Positive)
-	var count int
-	err := config.DB.QueryRow(config.Ctx, "SELECT COUNT(*) FROM users WHERE email = $1", email).Scan(&count)
-	if err != nil {
-		c.JSON(500, gin.H{"success": false, "message": "Lỗi hệ thống"})
-		return
-	}
-
-	c.JSON(200, gin.H{
-		"success": true,
-		"data": gin.H{
-			"available": count == 0,
-			"method":    "database",
-		},
-	})
+	// Trả response thống nhất — không leak thông tin email có tồn tại hay không.
+	// /auth/register sẽ trả 409 EMAIL_ALREADY_EXISTS nếu submit với email đã dùng.
+	c.JSON(200, gin.H{"success": true, "message": "Nếu email hợp lệ, bạn có thể tiếp tục đăng ký."})
 }

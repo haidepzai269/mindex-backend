@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"log"
 	"mindex-backend/config"
 	"mindex-backend/models"
@@ -11,8 +12,10 @@ import (
 
 // PublishNotification thực hiện lưu thông báo vào DB và đẩy qua Redis PubSub
 func PublishNotification(userID string, nType string, title string, message string, data interface{}) error {
+	title = html.EscapeString(title)
+	message = html.EscapeString(message)
 	dataBytes, _ := json.Marshal(data)
-	
+
 	// 1. Lưu vào Database (Persistence)
 	var n models.Notification
 	err := config.DB.QueryRow(context.Background(), `

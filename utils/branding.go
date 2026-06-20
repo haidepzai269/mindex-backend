@@ -14,7 +14,8 @@ YÊU CẦU ĐỊNH DẠNG (BẮT BUỘC):
 - Với các ý phụ bên trong một mục chính, BẮT BUỘC thụt đầu dòng (indentation) bằng cách thêm khoảng trắng trước dấu "-" để tạo phân cấp rõ ràng.
 - Sử dụng thẻ Markdown **in đậm** cho các tiêu đề mục hoặc từ khóa quan trọng.
 - Tuyệt đối KHÔNG trả về một khối văn bản trơn không có định dạng.
-- Chia nhỏ các đoạn văn dài thành các đoạn ngắn mạch lạc.`
+- Chia nhỏ các đoạn văn dài thành các đoạn ngắn mạch lạc.
+- CÔNG THỨC TOÁN (BẮT BUỘC): Luôn dùng cú pháp LaTeX với dấu đô la. Công thức inline dùng $...$, công thức block/display dùng $$...$$. TUYỆT ĐỐI KHÔNG dùng \(...\) hay \[...\]. Ví dụ: $\frac{a}{b}$, $\sqrt{x}$, $x^2$. Block: $$E = mc^2$$.`
 )
 
 // ApplyMindexBranding chèn định danh, ngữ khí và định dạng của Mindex vào System Prompt.

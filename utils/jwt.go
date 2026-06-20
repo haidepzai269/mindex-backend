@@ -16,15 +16,14 @@ type JWTClaims struct {
 	jwt.RegisteredClaims
 }
 
-func GenerateTokenPair(userID, role, persona string) (string, string, error) {
-	// 1. Access Token (Rút ngắn xuống 15 phút để bảo mật)
-	accessID := uuid.New().String()
+func GenerateTokenPair(userID, role, persona string, rememberMe bool) (string, string, string, error) {
+	// 1. Access Token — 15 phút
 	accessClaims := JWTClaims{
 		UserID:  userID,
 		Role:    role,
 		Persona: persona,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ID:        accessID,
+			ID:        uuid.New().String(),
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(15 * time.Minute)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
@@ -32,28 +31,32 @@ func GenerateTokenPair(userID, role, persona string) (string, string, error) {
 	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
 	accessString, err := accessToken.SignedString([]byte(config.Env.JWTSecret))
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
-	// 2. Refresh Token (Giữ nguyên 7 ngày)
-	refreshID := uuid.New().String()
+	// 2. Refresh Token — 10 ngày nếu rememberMe, ngược lại 7 ngày
+	refreshTTL := 7 * 24 * time.Hour
+	if rememberMe {
+		refreshTTL = 10 * 24 * time.Hour
+	}
+	refreshJTI := uuid.New().String()
 	refreshClaims := JWTClaims{
 		UserID:  userID,
 		Role:    role,
 		Persona: persona,
 		RegisteredClaims: jwt.RegisteredClaims{
-			ID:        refreshID,
-			ExpiresAt: jwt.NewNumericDate(time.Now().Add(7 * 24 * time.Hour)),
+			ID:        refreshJTI,
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(refreshTTL)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 	}
 	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
 	refreshString, err := refreshToken.SignedString([]byte(config.Env.JWTRefreshSecret))
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
-	return accessString, refreshString, nil
+	return accessString, refreshString, refreshJTI, nil
 }
 
 func VerifyToken(tokenString string, isRefresh bool) (*JWTClaims, error) {

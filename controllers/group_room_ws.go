@@ -21,7 +21,9 @@ import (
 var roomWsUpgrader = gorillaws.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		return config.IsAllowedOrigin(r.Header.Get("Origin"))
+	},
 }
 
 // ConnectRoomWS — GET /api/v1/rooms/:id/ws
@@ -35,7 +37,11 @@ func ConnectRoomWS(c *gin.Context) {
 		return
 	}
 
-	conn, _ := roomWsUpgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := roomWsUpgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Printf("Room WS Upgrade Error: %v", err)
+		return
+	}
 
 	client := &ws.RoomClient{
 		Hub:    ws.RoomHubInstance,
@@ -68,6 +74,19 @@ func ConnectRoomWS(c *gin.Context) {
 	})
 }
 
+// wsRateLimitOK kiểm tra rate limit cho WS message (10 msg / 10s per user per room)
+func wsRateLimitOK(roomID, userID string) bool {
+	if config.RedisClient == nil {
+		return true
+	}
+	key := fmt.Sprintf("ws_rate:%s:%s", roomID, userID)
+	count, _ := config.RedisClient.Incr(config.Ctx, key).Result()
+	if count == 1 {
+		config.RedisClient.Expire(config.Ctx, key, 10*time.Second)
+	}
+	return count <= 10
+}
+
 // handleRoomIncomingMessage xử lý tin nhắn đến từ client WS
 func handleRoomIncomingMessage(client *ws.RoomClient, roomID, userID string, raw []byte) {
 	var incoming struct {
@@ -93,6 +112,16 @@ func handleRoomIncomingMessage(client *ws.RoomClient, roomID, userID string, raw
 
 	case "chat_message":
 		if strings.TrimSpace(incoming.Text) == "" {
+			return
+		}
+
+		// Recheck membership — user có thể đã bị kick hoặc đã leave
+		if !IsRoomMember(roomID, userID) {
+			return
+		}
+
+		// Rate limit WS messages
+		if !wsRateLimitOK(roomID, userID) {
 			return
 		}
 
@@ -148,6 +177,11 @@ func handleRoomIncomingMessage(client *ws.RoomClient, roomID, userID string, raw
 		})
 
 	case "message_reaction":
+		// Recheck membership
+		if !IsRoomMember(roomID, userID) {
+			return
+		}
+
 		var reactReq struct {
 			MessageID string `json:"message_id"`
 			Emoji     string `json:"emoji"`
@@ -176,7 +210,7 @@ func handleMessageReaction(roomID, userID, msgID, emoji string) {
 			if m.Reactions == nil {
 				m.Reactions = make(map[string][]string)
 			}
-			
+
 			// Toggle reaction: Nếu đã thả cùng emoji thì xóa, chưa thì thêm
 			uids := m.Reactions[emoji]
 			found := false
@@ -190,7 +224,7 @@ func handleMessageReaction(roomID, userID, msgID, emoji string) {
 			if !found {
 				m.Reactions[emoji] = append(uids, userID)
 			}
-			
+
 			if len(m.Reactions[emoji]) == 0 {
 				delete(m.Reactions, emoji)
 			}
@@ -447,7 +481,6 @@ func handleRoomAI(roomID, callerUserID, query string) {
 	})
 }
 
-
 // getRoomChatHistory lấy N tin nhắn gần nhất từ Redis
 func getRoomChatHistory(roomID string, n int) string {
 	if config.RedisClient == nil {
@@ -520,20 +553,23 @@ func GetRoomHistory(c *gin.Context) {
 	var err error
 
 	type rowMsg struct {
-		ID        string    `json:"id"`
-		RoomID    string    `json:"room_id"`
-		UserID    *string   `json:"user_id"`
-		UserName  string    `json:"user_name"`
-		Text      string    `json:"text"`
-		ReplyToID *string   `json:"reply_to_id"`
-		MentionsAI bool     `json:"mentions_ai"`
-		IsAI      bool      `json:"is_ai"`
-		Timestamp time.Time `json:"timestamp"`
+		ID         string    `json:"id"`
+		RoomID     string    `json:"room_id"`
+		UserID     *string   `json:"user_id"`
+		UserName   string    `json:"user_name"`
+		Text       string    `json:"text"`
+		ReplyToID  *string   `json:"reply_to_id"`
+		MentionsAI bool      `json:"mentions_ai"`
+		IsAI       bool      `json:"is_ai"`
+		Timestamp  time.Time `json:"timestamp"`
 	}
 	_ = rows
 	_ = err
 
-	var dbRows interface{ Next() bool; Close() }
+	var dbRows interface {
+		Next() bool
+		Close()
+	}
 	var queryErr error
 
 	if beforeStr != "" && beforeStr != "0" {

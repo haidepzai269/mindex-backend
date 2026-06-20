@@ -304,13 +304,18 @@ func validateDocumentSignature(fileName string, size int64, readHeader func() ([
 			return uploadFileInfo{}, &uploadValidationError{Status: http.StatusUnsupportedMediaType, Code: "INVALID_FILE_SIGNATURE", Message: "File PDF khong hop le"}
 		}
 		return uploadFileInfo{FileName: fileName, Extension: ext, MimeType: "application/pdf"}, nil
-	case ".docx":
+	case ".docx", ".xlsx", ".pptx":
 		if len(header) < 4 || string(header[:4]) != "PK\x03\x04" {
-			return uploadFileInfo{}, &uploadValidationError{Status: http.StatusUnsupportedMediaType, Code: "INVALID_FILE_SIGNATURE", Message: "File DOCX khong hop le"}
+			return uploadFileInfo{}, &uploadValidationError{Status: http.StatusUnsupportedMediaType, Code: "INVALID_FILE_SIGNATURE", Message: "File Office khong hop le"}
 		}
-		return uploadFileInfo{FileName: fileName, Extension: ext, MimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}, nil
+		mimeTypes := map[string]string{
+			".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+			".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+			".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		}
+		return uploadFileInfo{FileName: fileName, Extension: ext, MimeType: mimeTypes[ext]}, nil
 	default:
-		return uploadFileInfo{}, &uploadValidationError{Status: http.StatusUnsupportedMediaType, Code: "UNSUPPORTED_FILE_TYPE", Message: "Chi ho tro PDF hoac DOCX"}
+		return uploadFileInfo{}, &uploadValidationError{Status: http.StatusUnsupportedMediaType, Code: "UNSUPPORTED_FILE_TYPE", Message: "Chi ho tro PDF, DOCX, XLSX, PPTX"}
 	}
 }
 

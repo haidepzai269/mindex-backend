@@ -259,7 +259,8 @@ def group_words_into_lines(words: list, y_tolerance: float = 3.0) -> list:
     return lines
 
 
-def is_docx_by_magic(path):
+def is_office_by_magic(path):
+    """DOCX, XLSX, PPTX đều dùng ZIP container PK\x03\x04"""
     with open(path, "rb") as f:
         return f.read(4).startswith(b"PK\x03\x04")
 
@@ -267,6 +268,126 @@ def is_docx_by_magic(path):
 def is_pdf_by_magic(path):
     with open(path, "rb") as f:
         return f.read(4).startswith(b"%PDF")
+
+
+def markdown_to_blocks(markdown: str) -> list[Block]:
+    """Chuyển Markdown output của MarkItDown về []Block để chunker.go không cần thay đổi."""
+    blocks = []
+    lines = markdown.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped:
+            i += 1
+            continue
+
+        if stripped.startswith("### "):
+            blocks.append(Block("heading3", stripped[4:].strip(), level=3))
+        elif stripped.startswith("## "):
+            blocks.append(Block("heading2", stripped[3:].strip(), level=2))
+        elif stripped.startswith("# "):
+            blocks.append(Block("heading1", stripped[2:].strip(), level=1))
+        elif stripped.startswith("|") and "|" in stripped:
+            # Thu thập toàn bộ bảng liên tiếp
+            table_lines = []
+            while i < len(lines):
+                row = lines[i].strip()
+                if not (row.startswith("|") and "|" in row):
+                    break
+                # Bỏ qua separator row |---|---|
+                if not re.match(r"^\|[\s\-:]+\|", row):
+                    table_lines.append(row)
+                i += 1
+            if table_lines:
+                blocks.append(Block("table", "\n".join(table_lines)))
+            continue
+        elif stripped.startswith("```"):
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            if code_lines:
+                blocks.append(Block("code", "\n".join(code_lines)))
+        elif is_list_item(stripped):
+            blocks.append(Block("list_item", stripped))
+        else:
+            blocks.append(Block("paragraph", stripped))
+
+        i += 1
+    return blocks
+
+
+def extract_office_with_markitdown(path: str) -> list[Block]:
+    from markitdown import MarkItDown
+
+    result = MarkItDown().convert(path)
+    content = result.text_content or ""
+    if len(content.strip()) < 20:
+        return []
+    return markdown_to_blocks(content)
+
+
+def extract_docx(path: str) -> list[Block]:
+    """Thử MarkItDown trước (bảng chuẩn hơn), fallback về python-docx."""
+    try:
+        blocks = extract_office_with_markitdown(path)
+        if blocks:
+            return blocks
+    except Exception:
+        pass
+
+    # Fallback: python-docx
+    from docx import Document
+
+    doc = Document(path)
+    blocks = []
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if not text:
+            continue
+
+        style_name = para.style.name if para.style else "normal"
+        style = style_name.lower()
+
+        if "heading 1" in style:
+            blocks.append(Block("heading1", text, level=1))
+        elif "heading 2" in style:
+            blocks.append(Block("heading2", text, level=2))
+        elif "heading 3" in style:
+            blocks.append(Block("heading3", text, level=3))
+        elif style in ("list paragraph", "list bullet", "list number"):
+            blocks.append(Block("list_item", text))
+        elif style == "caption":
+            blocks.append(Block("caption", text))
+        elif "title" in style:
+            blocks.append(Block("heading1", text, level=1))
+        elif "subtitle" in style:
+            blocks.append(Block("heading2", text, level=2))
+        else:
+            if style == "normal" and len(text) < 100:
+                is_bold = all(run.bold for run in para.runs if run.text.strip())
+                if is_bold and len(para.runs) > 0:
+                    blocks.append(Block("heading3", text, level=3))
+                    continue
+
+            if para.runs and para.runs[0].font and para.runs[0].font.name in ("Courier New", "Consolas", "Courier", "Monaco"):
+                blocks.append(Block("code", text))
+            else:
+                blocks.append(Block("paragraph", text))
+
+    for table in doc.tables:
+        rows = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            rows.append(" | ".join(cells))
+        table_text = "\n".join(rows)
+        if table_text.strip():
+            blocks.append(Block("table", table_text))
+
+    return blocks
 
 
 def main():
@@ -282,19 +403,14 @@ def main():
         sys.exit(1)
 
     try:
-        if is_pdf_by_magic(path):
+        ext = Path(path).suffix.lower()
+        if is_pdf_by_magic(path) or ext == ".pdf":
             blocks = extract_pdf(path)
-        elif is_docx_by_magic(path):
-            blocks = extract_docx(path)
+        elif is_office_by_magic(path) or ext in (".docx", ".doc", ".xlsx", ".pptx"):
+            blocks = extract_docx(path) if ext in (".docx", ".doc") else extract_office_with_markitdown(path)
         else:
-            ext = Path(path).suffix.lower()
-            if ext == ".pdf":
-                blocks = extract_pdf(path)
-            elif ext in (".docx", ".doc"):
-                blocks = extract_docx(path)
-            else:
-                print(json.dumps({"error": f"Unsupported format and magic bytes did not match: {ext}"}))
-                sys.exit(1)
+            print(json.dumps({"error": f"Unsupported format: {ext}"}))
+            sys.exit(1)
 
         if not blocks:
             blocks = [Block("empty", "", level=0)]

@@ -6,11 +6,12 @@ import (
 	"mindex-backend/config"
 	"mindex-backend/internal/persona"
 	"mindex-backend/internal/startup"
+	"mindex-backend/internal/ws"
+	"mindex-backend/middleware"
 	"mindex-backend/routes"
 	"mindex-backend/utils"
-    "mindex-backend/utils/quota"
+	"mindex-backend/utils/quota"
 	"mindex-backend/workers"
-	"mindex-backend/internal/ws"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -32,7 +33,7 @@ func main() {
 	utils.HFPool = utils.NewApiKeyPool("hf", config.Env.HuggingFaceKeys)
 	utils.NineRouterPool = utils.NewApiKeyPool("ninerouter", config.Env.NineRouterKeys)
 	utils.NineRouterChatPool = utils.NewApiKeyPool("ninerouter_chat", config.Env.NineRouterChatKeys)
-	
+
 	log.Printf("Đã khởi tạo Gemini Pool: Chat (%d keys), Embed (%d keys)", len(config.Env.GeminiChatKeys), len(config.Env.GeminiEmbedKeys))
 	log.Printf("Đã khởi tạo Groq Pool với %d keys", len(config.Env.GroqKeys))
 	log.Printf("Đã khởi tạo Cerebras Pool với %d keys", len(config.Env.CerebrasKeys))
@@ -53,19 +54,37 @@ func main() {
 	// Chạy DDL idempotent một lần khi khởi động (thay vì trong handlers)
 	startup.RunMigrations()
 
-    // 3c. Init Quota Tracker
-    quota.InitTracker()
-    
-    // Register Keys to Tracker
-    for i, k := range config.Env.GeminiChatKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderGemini, fmt.Sprintf("gemini_chat_%d", i+1)) }
-    for i, k := range config.Env.GeminiEmbedKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderGemini, fmt.Sprintf("gemini_embed_%d", i+1)) }
-    for i, k := range config.Env.GroqKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderGroq, fmt.Sprintf("groq_%d", i+1)) }
-    for i, k := range config.Env.CerebrasKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderCerebras, fmt.Sprintf("cerebras_%d", i+1)) }
-    for i, k := range config.Env.MistralKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderMistral, fmt.Sprintf("mistral_%d", i+1)) }
-    for i, k := range config.Env.OpenRouterKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderOpenRouter, fmt.Sprintf("openrouter_%d", i+1)) }
-    for i, k := range config.Env.HuggingFaceKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderHuggingFace, fmt.Sprintf("hf_%d", i+1)) }
-    for i, k := range config.Env.NineRouterKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderNineRouter, fmt.Sprintf("ninerouter_%d", i+1)) }
-    for i, k := range config.Env.NineRouterChatKeys { quota.GlobalTracker.RegisterKey(k, quota.ProviderNineRouter, fmt.Sprintf("ninerouter_chat_%d", i+1)) }
+	// 3c. Init Quota Tracker
+	quota.InitTracker()
+
+	// Register Keys to Tracker
+	for i, k := range config.Env.GeminiChatKeys {
+		quota.GlobalTracker.RegisterKey(k, quota.ProviderGemini, fmt.Sprintf("gemini_chat_%d", i+1))
+	}
+	for i, k := range config.Env.GeminiEmbedKeys {
+		quota.GlobalTracker.RegisterKey(k, quota.ProviderGemini, fmt.Sprintf("gemini_embed_%d", i+1))
+	}
+	for i, k := range config.Env.GroqKeys {
+		quota.GlobalTracker.RegisterKey(k, quota.ProviderGroq, fmt.Sprintf("groq_%d", i+1))
+	}
+	for i, k := range config.Env.CerebrasKeys {
+		quota.GlobalTracker.RegisterKey(k, quota.ProviderCerebras, fmt.Sprintf("cerebras_%d", i+1))
+	}
+	for i, k := range config.Env.MistralKeys {
+		quota.GlobalTracker.RegisterKey(k, quota.ProviderMistral, fmt.Sprintf("mistral_%d", i+1))
+	}
+	for i, k := range config.Env.OpenRouterKeys {
+		quota.GlobalTracker.RegisterKey(k, quota.ProviderOpenRouter, fmt.Sprintf("openrouter_%d", i+1))
+	}
+	for i, k := range config.Env.HuggingFaceKeys {
+		quota.GlobalTracker.RegisterKey(k, quota.ProviderHuggingFace, fmt.Sprintf("hf_%d", i+1))
+	}
+	for i, k := range config.Env.NineRouterKeys {
+		quota.GlobalTracker.RegisterKey(k, quota.ProviderNineRouter, fmt.Sprintf("ninerouter_%d", i+1))
+	}
+	for i, k := range config.Env.NineRouterChatKeys {
+		quota.GlobalTracker.RegisterKey(k, quota.ProviderNineRouter, fmt.Sprintf("ninerouter_chat_%d", i+1))
+	}
 
 	// 3b. Init Persona Cache
 	if err := persona.Cache.Load(config.DB); err != nil {
@@ -100,15 +119,14 @@ func main() {
 
 	// 4. Khởi chạy Background Workers
 	workers.StartWorkerPool()
-	workers.StartSweeper()              // Chạy ngầm dọn dẹp lúc 3AM
-	workers.StartExpirer()              // Thông báo hết hạn realtime
-	workers.StartAlertChecker()         // Giám sát chất lượng AI
-	workers.StartSubscriptionExpirer()  // Downgrade tier hết hạn lúc 2AM
+	workers.StartSweeper()             // Chạy ngầm dọn dẹp lúc 3AM
+	workers.StartExpirer()             // Thông báo hết hạn realtime
+	workers.StartAlertChecker()        // Giám sát chất lượng AI
+	workers.StartSubscriptionExpirer() // Downgrade tier hết hạn lúc 2AM
 
 	// 4b. Khởi chạy WebSocket Hub cho Feedback & Group Chat
 	go ws.GlobalHub.Run()
 	go ws.RoomHubInstance.Run()
-
 
 	// 5. Init router
 	r := gin.Default()
@@ -126,6 +144,7 @@ func main() {
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))
+	r.Use(middleware.RequireTrustedOrigin())
 
 	// 6. Routes
 	api := r.Group("/api/v1")
@@ -153,6 +172,7 @@ func main() {
 		routes.RegisterAnalyticsRoutes(api)    // Learning Analytics
 		routes.RegisterGamificationRoutes(api) // Badges + Streaks
 		routes.RegisterProfileRoutes(api)      // Public Profiles
+		routes.RegisterDashboardRoutes(api)    // User Dashboard
 	}
 
 	// 8. Start server

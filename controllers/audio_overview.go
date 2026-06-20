@@ -53,6 +53,19 @@ func GenerateAudioOverview(c *gin.Context) {
 	docID := c.Param("doc_id")
 	userID := c.GetString("user_id")
 
+	// Kiểm tra quyền truy cập document (owner hoặc public)
+	var hasAccess bool
+	config.DB.QueryRow(config.Ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM documents d
+			LEFT JOIN document_references dr ON d.id = dr.document_id AND dr.user_id = $2
+			WHERE d.id = $1 AND (dr.user_id IS NOT NULL OR d.is_public = TRUE)
+		)`, docID, userID).Scan(&hasAccess)
+	if !hasAccess {
+		c.JSON(http.StatusForbidden, gin.H{"success": false, "message": "Bạn không có quyền truy cập tài liệu này"})
+		return
+	}
+
 	// Check if exists
 	var existing AudioOverview
 	err := config.DB.QueryRow(config.Ctx, `

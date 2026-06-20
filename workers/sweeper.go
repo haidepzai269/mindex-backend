@@ -38,14 +38,6 @@ func StartSweeper() {
 func RunSweeperNow() (map[string]interface{}, error) {
 	start := time.Now()
 
-	// 1. Lấy danh sách các tài liệu sắp bị xóa để gửi thông báo
-	// (Chỉ doc còn references - soft-deleted docs không có references nên skip)
-	rows, err := config.DB.Query(config.Ctx, `
-		SELECT d.id, dr.user_id, d.title, d.is_public, d.cloudinary_public_id
-		FROM documents d
-		JOIN document_references dr ON dr.document_id = d.id
-		WHERE d.expired_at IS NOT NULL AND d.expired_at < NOW() AND d.deleted_at IS NULL`)
-
 	type delDoc struct {
 		ID       string
 		UserID   string
@@ -55,9 +47,22 @@ func RunSweeperNow() (map[string]interface{}, error) {
 	}
 	var toDelete []delDoc
 	shouldClearCommunity := false
+	var privCount, pubCount int64
 
+	// SELECT + DELETE trong cùng transaction để tránh gửi thông báo trùng lặp
+	tx, err := config.DB.Begin(config.Ctx)
+	if err != nil {
+		log.Println("Sweeper error (begin tx):", err)
+		return nil, err
+	}
+	defer tx.Rollback(config.Ctx)
+
+	rows, err := tx.Query(config.Ctx, `
+		SELECT d.id, dr.user_id, d.title, d.is_public, d.cloudinary_public_id
+		FROM documents d
+		JOIN document_references dr ON dr.document_id = d.id
+		WHERE d.expired_at IS NOT NULL AND d.expired_at < NOW() AND d.deleted_at IS NULL`)
 	if err == nil {
-		defer rows.Close()
 		for rows.Next() {
 			var d delDoc
 			if err := rows.Scan(&d.ID, &d.UserID, &d.Title, &d.IsPublic, &d.PublicID); err == nil {
@@ -67,27 +72,32 @@ func RunSweeperNow() (map[string]interface{}, error) {
 				}
 			}
 		}
+		rows.Close()
 	}
 
-	// 2. Thực hiện xóa hàng loạt
-	// Xóa tài liệu cá nhân hết hạn (bỏ qua soft-deleted - chúng có pipeline riêng)
-	resPriv, err := config.DB.Exec(config.Ctx, `
+	resPriv, err := tx.Exec(config.Ctx, `
 		DELETE FROM documents
 		WHERE expired_at IS NOT NULL AND expired_at < NOW()
-		  AND is_public = FALSE AND deleted_at IS NULL
-	`)
+		  AND is_public = FALSE AND deleted_at IS NULL`)
 	if err != nil {
 		log.Println("Sweeper error (Private):", err)
+		return nil, err
 	}
+	privCount = resPriv.RowsAffected()
 
-	// Đào thải tài liệu công cộng hết hạn
-	resPub, err := config.DB.Exec(config.Ctx, `
+	resPub, err := tx.Exec(config.Ctx, `
 		DELETE FROM documents
 		WHERE expired_at IS NOT NULL AND expired_at < NOW()
-		  AND is_public = TRUE AND deleted_at IS NULL
-	`)
+		  AND is_public = TRUE AND deleted_at IS NULL`)
 	if err != nil {
 		log.Println("Sweeper error (Public):", err)
+		return nil, err
+	}
+	pubCount = resPub.RowsAffected()
+
+	if err := tx.Commit(config.Ctx); err != nil {
+		log.Println("Sweeper error (commit):", err)
+		return nil, err
 	}
 
 	// Hard-delete các tài liệu soft-deleted sau 7 ngày, kèm dọn Cloudinary
@@ -96,7 +106,7 @@ func RunSweeperNow() (map[string]interface{}, error) {
 
 	retentionStats := runRetentionCleanup()
 
-	// 3. Gửi thông báo cho từng người dùng (Background)
+	// Gửi thông báo CHỈ SAU KHI transaction commit thành công
 	go func() {
 		for _, d := range toDelete {
 			utils.ClearUserCache("docs", d.UserID)
@@ -120,15 +130,12 @@ func RunSweeperNow() (map[string]interface{}, error) {
 		}
 	}()
 
-	// Document_chunks tự động bị xóa nhờ ON DELETE CASCADE
-	// (Giải phóng dung lượng Vector Storage lớn nhất)
-
 	log.Printf("🧹 [Sweeper] Đã dọn dẹp %d private docs, %d public docs, %d soft-deleted docs",
-		resPriv.RowsAffected(), resPub.RowsAffected(), len(softDelDocs))
+		privCount, pubCount, len(softDelDocs))
 
 	return map[string]interface{}{
-		"deleted_private": resPriv.RowsAffected(),
-		"deleted_public":  resPub.RowsAffected(),
+		"deleted_private": privCount,
+		"deleted_public":  pubCount,
 		"retention":       retentionStats,
 		"duration_ms":     time.Since(start).Milliseconds(),
 	}, nil

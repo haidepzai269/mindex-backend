@@ -42,13 +42,49 @@ func NormalizeSensitiveText(text string) string {
 	return sb.String()
 }
 
-// IsSensitiveContent kiểm tra xem text có chứa từ nhạy cảm không
-func IsSensitiveContent(text string) bool {
-	normText := NormalizeSensitiveText(text)
-	for _, w := range sensitiveWords {
-		if strings.Contains(normText, w) {
+// hasVietnameseDiacritics trả về true nếu word chứa ký tự non-ASCII (tức là có dấu tiếng Việt).
+// Dùng để phân biệt "dự" (có nghĩa, có dấu) với "du" (tục tĩu, không dấu).
+func hasVietnameseDiacritics(word string) bool {
+	for _, r := range word {
+		if r > 127 {
 			return true
 		}
 	}
+	return false
+}
+
+// IsSensitiveContent kiểm tra xem text có chứa từ nhạy cảm không.
+//
+// Hai bước:
+//  1. Per-word: kiểm tra từng token riêng. Từ ngắn (<=3 ký tự) chỉ exact-match để tránh
+//     false positive kiểu "dự" → "du", "cự" → "cu". Nếu từ gốc có dấu tiếng Việt thì bỏ qua.
+//  2. Anti-evasion: collapse toàn bộ (xóa khoảng trắng) để bắt "f u c k", "d.i.t.m.e".
+//     Chỉ áp dụng cho từ nhạy cảm dài >= 4 ký tự.
+func IsSensitiveContent(text string) bool {
+	// Bước 1: per-word check
+	for _, word := range strings.Fields(text) {
+		normWord := NormalizeSensitiveText(word)
+		for _, sw := range sensitiveWords {
+			if len(sw) <= 3 {
+				// Exact match; nếu từ gốc có dấu tiếng Việt → không phải tục tĩu
+				if normWord == sw && !hasVietnameseDiacritics(word) {
+					return true
+				}
+			} else {
+				if strings.Contains(normWord, sw) {
+					return true
+				}
+			}
+		}
+	}
+
+	// Bước 2: anti-evasion (chỉ từ >= 4 ký tự để không bắt nhầm "du" trong "duan")
+	collapsed := NormalizeSensitiveText(text)
+	for _, sw := range sensitiveWords {
+		if len(sw) >= 4 && strings.Contains(collapsed, sw) {
+			return true
+		}
+	}
+
 	return false
 }
