@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -495,6 +496,10 @@ func probeVideoDuration(path string) (int, error) {
 	cmd := exec.CommandContext(ctx, "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
 	output, err := cmd.Output()
 	if err != nil {
+		if errors.Is(err, exec.ErrNotFound) {
+			// ffprobe not installed; skip duration check, processing service will validate
+			return 0, nil
+		}
 		return 0, fmt.Errorf("ffprobe failed: %w", err)
 	}
 	val, err := strconv.ParseFloat(strings.TrimSpace(string(output)), 64)
