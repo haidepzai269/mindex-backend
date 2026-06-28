@@ -28,7 +28,8 @@ func RunExpirerNow() {
 		SELECT d.id, dr.user_id, d.title, d.expired_at
 		FROM documents d
 		JOIN document_references dr ON dr.document_id = d.id
-		WHERE d.expired_at IS NOT NULL
+		WHERE d.deleted_at IS NULL
+		  AND d.expired_at IS NOT NULL
 		  AND d.expired_at < NOW()
 		  AND d.expiration_notified = FALSE
 		LIMIT 100`)

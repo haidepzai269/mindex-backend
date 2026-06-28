@@ -63,10 +63,10 @@ func InitOrchestrator() {
 	// 1. CHAT (RAG) - Ưu tiên Mindex2 (Combo 10 LLMs), Fallback sang các Provider khác nếu lỗi
 	AI.Priorities[ServiceChat] = []AIProviderConfig{
 		{Type: ProviderNineRouter, Model: config.Env.NineRouterChatModel, Pool: NineRouterChatPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
-		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
-		{Type: ProviderCerebras, Model: "qwen-3-235b-a22b-instruct-2507", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
+		{Type: ProviderGroq, Model: "openai/gpt-oss-120b", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
+		{Type: ProviderCerebras, Model: "zai-glm-4.7", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
 		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
-		{Type: ProviderOpenRouter, Model: "google/gemini-2.0-flash-exp:free", Pool: OpenRouterPool, IsOpenAI: true, BaseURL: "https://openrouter.ai/api/v1"},
+		{Type: ProviderOpenRouter, Model: "google/gemma-4-31b-it:free", Pool: OpenRouterPool, IsOpenAI: true, BaseURL: "https://openrouter.ai/api/v1"},
 	}
 
 	// 2. TÓM TẮT (SUMMARY) - NineRouter lên vị trí số 1
@@ -74,7 +74,7 @@ func InitOrchestrator() {
 		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderGemini, Model: "gemini-2.5-flash-lite", Pool: GeminiChatPool, IsOpenAI: false},
 		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
-		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
+		{Type: ProviderGroq, Model: "openai/gpt-oss-120b", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
 		{Type: ProviderOpenRouter, Model: "deepseek/deepseek-r1:free", Pool: OpenRouterPool, IsOpenAI: true, BaseURL: "https://openrouter.ai/api/v1"},
 	}
 
@@ -82,14 +82,14 @@ func InitOrchestrator() {
 	AI.Priorities[ServiceClassify] = []AIProviderConfig{
 		{Type: ProviderGemini, Model: "gemini-2.5-flash-lite", Pool: GeminiChatPool, IsOpenAI: false},
 		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
-		{Type: ProviderCerebras, Model: "qwen-3-235b-a22b-instruct-2507", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
-		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
+		{Type: ProviderCerebras, Model: "zai-glm-4.7", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
+		{Type: ProviderGroq, Model: "openai/gpt-oss-120b", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
 		{Type: ProviderHF, Model: "facebook/bart-large-mnli", Pool: HFPool, IsOpenAI: false},
 	}
 
 	// 4. TÌM KIẾM (SEARCH) - NineRouter ở vị trí số 3
 	AI.Priorities[ServiceSearch] = []AIProviderConfig{
-		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
+		{Type: ProviderGroq, Model: "openai/gpt-oss-120b", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
 		{Type: ProviderCerebras, Model: "llama3.1-8b", Pool: CerebrasPool, IsOpenAI: true, BaseURL: "https://api.cerebras.ai/v1"},
 		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
@@ -98,7 +98,7 @@ func InitOrchestrator() {
 
 	// 5. AUDIO OVERVIEW - Ưu tiên Groq, fallback NineRouter, rồi Gemini
 	AI.Priorities[ServiceAudio] = []AIProviderConfig{
-		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
+		{Type: ProviderGroq, Model: "openai/gpt-oss-120b", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
 		{Type: ProviderNineRouter, Model: config.Env.NineRouterModel, Pool: NineRouterPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderGemini, Model: "gemini-1.5-flash", Pool: GeminiChatPool, IsOpenAI: false},
 	}
@@ -108,8 +108,8 @@ func InitOrchestrator() {
 		{Type: ProviderNineRouter, Model: config.Env.NineRouterChatModel, Pool: NineRouterChatPool, IsOpenAI: true, BaseURL: config.Env.NineRouterBaseURL},
 		{Type: ProviderGemini, Model: "gemini-2.5-flash-lite", Pool: GeminiChatPool, IsOpenAI: false},
 		{Type: ProviderMistral, Model: "mistral-small-latest", Pool: MistralPool, IsOpenAI: true, BaseURL: "https://api.mistral.ai/v1"},
-		{Type: ProviderGroq, Model: "llama-3.3-70b-versatile", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
-		{Type: ProviderOpenRouter, Model: "google/gemini-2.0-flash-exp:free", Pool: OpenRouterPool, IsOpenAI: true, BaseURL: "https://openrouter.ai/api/v1"},
+		{Type: ProviderGroq, Model: "openai/gpt-oss-120b", Pool: GroqPool, IsOpenAI: true, BaseURL: "https://api.groq.com/openai/v1"},
+		{Type: ProviderOpenRouter, Model: "google/gemma-4-31b-it:free", Pool: OpenRouterPool, IsOpenAI: true, BaseURL: "https://openrouter.ai/api/v1"},
 	}
 }
 
@@ -220,4 +220,38 @@ func (o *AIOrchestrator) ChatNonStream(service ServiceType, messages []ChatMessa
 	}
 
 	return "", "", fmt.Errorf("tất cả các provider đều thất bại: %v", lastErr)
+}
+
+// ChatNonStreamWithTools mirrors ChatNonStream but passes tool schemas to the
+// provider and returns any tool_calls the LLM requested, for the AI Tool
+// Framework's function-calling loop. Only OpenAI-compatible providers
+// (NineRouter, Groq, Cerebras, Mistral, OpenRouter) support this path today;
+// Gemini/HF configs in the service's priority list are skipped here exactly
+// as ChatNonStream skips HF for unsupported services, so callers that don't
+// need tools should keep using ChatNonStream/ChatStream unchanged.
+func (o *AIOrchestrator) ChatNonStreamWithTools(service ServiceType, messages []ChatMessage, toolSchemas []ToolSchema) (string, []ToolCallRequest, ProviderType, error) {
+	configs := o.Priorities[service]
+	var lastErr error
+
+	for _, cfg := range configs {
+		if cfg.Pool == nil || len(cfg.Pool.keys) == 0 || !cfg.IsOpenAI {
+			continue
+		}
+
+		log.Printf("🛠️ [Orchestrator-Tools] [%s] Thử Provider: %s (Model: %s)", service, cfg.Type, cfg.Model)
+
+		answer, toolCalls, err := ChatOpenAINonStreamWithTools(cfg, messages, toolSchemas)
+		if err == nil && (strings.TrimSpace(answer) != "" || len(toolCalls) > 0) {
+			log.Printf("✅ [Orchestrator-Tools] [%s] Thành công với %s (%d chars, %d tool_calls)", service, cfg.Type, len(answer), len(toolCalls))
+			return answer, toolCalls, cfg.Type, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("provider %s trả về answer và tool_calls rỗng", cfg.Type)
+		}
+
+		lastErr = err
+		log.Printf("⚠️ [Orchestrator-Tools] [%s] Provider %s lỗi: %v. Đang fallback...", service, cfg.Type, err)
+	}
+
+	return "", nil, "", fmt.Errorf("tất cả các provider hỗ trợ tool calling đều thất bại: %v", lastErr)
 }

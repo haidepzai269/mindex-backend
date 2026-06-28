@@ -3,9 +3,11 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"mindex-backend/config"
 	"mindex-backend/internal/ws"
+	"mindex-backend/utils"
 	"net/http"
 	"time"
 
@@ -72,6 +74,69 @@ func CreateFeedbackSession(c *gin.Context) {
 	})
 
 	c.JSON(201, gin.H{"success": true, "session_id": sessionID})
+}
+
+// SendFeedbackEmail gửi email góp ý tới admin
+func SendFeedbackEmail(c *gin.Context) {
+	userID := c.GetString("user_id")
+
+	var req struct {
+		Subject string `json:"subject" binding:"required"`
+		Body    string `json:"body" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(400, gin.H{"success": false, "error": "Vui lòng nhập đầy đủ tiêu đề và nội dung"})
+		return
+	}
+
+	// Lấy email + name user từ DB
+	var userEmail, userName string
+	err := config.DB.QueryRow(config.Ctx,
+		`SELECT email, name FROM users WHERE id = $1`, userID,
+	).Scan(&userEmail, &userName)
+	if err != nil {
+		log.Printf("[SendFeedbackEmail] Không tìm thấy user %s: %v", userID, err)
+		c.JSON(500, gin.H{"success": false, "error": "Không thể xác định thông tin người gửi"})
+		return
+	}
+
+	// Xây dựng email HTML
+	adminEmail := "haidepzai2692006@gmail.com"
+	emailSubject := fmt.Sprintf("[Mindex Feedback] %s", req.Subject)
+	emailBody := fmt.Sprintf(`
+		<div style="font-family: 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #e5e7eb;">
+			<div style="background: linear-gradient(135deg, #7c3aed 0%%, #a855f7 50%%, #c084fc 100%%); padding: 24px 32px;">
+				<h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 700;">📧 Góp ý từ người dùng Mindex</h1>
+			</div>
+			<div style="padding: 32px;">
+				<table style="width: 100%%; margin-bottom: 24px; border-collapse: collapse;">
+					<tr>
+						<td style="padding: 8px 0; color: #6b7280; font-size: 14px; width: 100px;">Người gửi:</td>
+						<td style="padding: 8px 0; font-weight: 600; font-size: 14px;">%s (%s)</td>
+					</tr>
+					<tr>
+						<td style="padding: 8px 0; color: #6b7280; font-size: 14px;">Tiêu đề:</td>
+						<td style="padding: 8px 0; font-weight: 600; font-size: 14px;">%s</td>
+					</tr>
+				</table>
+				<div style="background: #f9fafb; border-radius: 12px; padding: 20px; border-left: 4px solid #7c3aed;">
+					<p style="margin: 0; font-size: 15px; line-height: 1.7; color: #1f2937; white-space: pre-wrap;">%s</p>
+				</div>
+			</div>
+			<div style="background: #f3f4f6; padding: 16px 32px; text-align: center;">
+				<p style="margin: 0; font-size: 12px; color: #9ca3af;">Email này được gửi qua hệ thống Mindex Feedback. Nhấn Reply để trả lời trực tiếp người dùng.</p>
+			</div>
+		</div>
+	`, userName, userEmail, req.Subject, req.Body)
+
+	err = utils.SendFeedbackEmail(adminEmail, userEmail, userName, emailSubject, emailBody)
+	if err != nil {
+		c.JSON(500, gin.H{"success": false, "error": "Không thể gửi email. Vui lòng thử lại sau."})
+		return
+	}
+
+	c.JSON(201, gin.H{"success": true, "message": "Email góp ý đã được gửi thành công"})
 }
 
 // GetFeedbackSessions lấy danh sách các phiên

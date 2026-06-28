@@ -497,9 +497,19 @@ func handleDuplicateDocument(c *gin.Context, doc existingDocument, roomID, userI
 }
 
 func restoreSoftDeletedDocument(c *gin.Context, doc existingDocument, roomID, userID string) {
-	if _, err := config.DB.Exec(config.Ctx,
-		`UPDATE documents SET deleted_at = NULL WHERE id = $1`, doc.ID,
-	); err != nil {
+	// Reset luôn expired_at/expiration_notified, không chỉ deleted_at.
+	// Nếu không, document vẫn mang expired_at cũ (đã qua) -> Expirer bắt lại và gửi thông báo hết hạn dù vừa được restore.
+	var err error
+	if roomID != "" {
+		_, err = config.DB.Exec(config.Ctx,
+			`UPDATE documents SET deleted_at = NULL, expired_at = NULL, expiration_notified = FALSE WHERE id = $1`, doc.ID,
+		)
+	} else {
+		_, err = config.DB.Exec(config.Ctx,
+			`UPDATE documents SET deleted_at = NULL, expired_at = NOW() + INTERVAL '24 hours', expiration_notified = FALSE WHERE id = $1`, doc.ID,
+		)
+	}
+	if err != nil {
 		c.JSON(500, gin.H{"success": false, "error": "RESTORE_FAILED", "message": "Khong the khoi phuc tai lieu"})
 		return
 	}

@@ -759,6 +759,32 @@ func writeChatInsight(c *gin.Context, flusher http.Flusher, text string) {
 	flusher.Flush()
 }
 
+// writeChatTokens sends a complete answer as word-chunked SSE "token"
+// events, for responses produced by the AI Tool Framework dispatcher
+// (non-streaming function-calling loop) rather than the streaming adapter.
+// Known trade-off: time-to-first-token equals total generation time here,
+// since the full answer exists before any token is sent.
+func writeChatRichContent(c *gin.Context, flusher http.Flusher, richContent json.RawMessage) {
+	if len(richContent) == 0 {
+		return
+	}
+	fmt.Fprintf(c.Writer, "event: rich_content\ndata: %s\n\n", string(richContent))
+	flusher.Flush()
+}
+
+func writeChatTokens(c *gin.Context, flusher http.Flusher, text string) {
+	words := strings.Fields(text)
+	for i, w := range words {
+		token := w
+		if i < len(words)-1 {
+			token += " "
+		}
+		tokenPayload, _ := json.Marshal(map[string]string{"token": token})
+		fmt.Fprintf(c.Writer, "event: token\ndata: %s\n\n", string(tokenPayload))
+		flusher.Flush()
+	}
+}
+
 func compactChatPreview(text string, limit int) string {
 	preview := strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
 	runes := []rune(preview)

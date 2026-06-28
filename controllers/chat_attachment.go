@@ -14,7 +14,6 @@ import (
 	"mindex-backend/utils"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -137,7 +136,7 @@ func UploadChatImageAttachment(c *gin.Context) {
 		return
 	}
 
-	ocrResult, ocrErr := runChatImageOCR(tmpPath)
+	ocrResult, ocrErr := runChatImageOCR(upload.SecureURL)
 	status := "done"
 	errorMessage := ""
 	if ocrErr != nil {
@@ -320,59 +319,24 @@ func readChatImageSize(path string) (int, int) {
 	return cfg.Width, cfg.Height
 }
 
-func runChatImageOCR(path string) (chatImageOCRResult, error) {
-	pythonPath, err := findPythonExecutable()
-	if err != nil {
-		return chatImageOCRResult{}, err
-	}
-	scriptPath, err := findImageOCRScript()
-	if err != nil {
-		return chatImageOCRResult{}, err
+func runChatImageOCR(imageURL string) (chatImageOCRResult, error) {
+	if utils.Processing == nil {
+		return chatImageOCRResult{}, errors.New("processing client not initialized")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, pythonPath, scriptPath, path)
-	output, err := cmd.CombinedOutput()
-	if ctx.Err() != nil {
-		return chatImageOCRResult{}, fmt.Errorf("ocr timeout: %w", ctx.Err())
-	}
+	raw, err := utils.Processing.CallSync("ocr", map[string]any{"image_url": imageURL}, 45*time.Second)
 	if err != nil {
-		return chatImageOCRResult{}, fmt.Errorf("ocr script failed: %w: %s", err, strings.TrimSpace(string(output)))
+		return chatImageOCRResult{}, fmt.Errorf("ocr processing failed: %w", err)
 	}
 
 	var result chatImageOCRResult
-	if err := json.Unmarshal(output, &result); err != nil {
-		return chatImageOCRResult{}, fmt.Errorf("parse ocr output: %w", err)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return chatImageOCRResult{}, fmt.Errorf("parse ocr result: %w", err)
 	}
 	if len(result.Blocks) == 0 {
 		result.Blocks = json.RawMessage("[]")
 	}
 	return result, nil
-}
-
-func findPythonExecutable() (string, error) {
-	for _, name := range []string{"python", "python3", "py"} {
-		path, err := exec.LookPath(name)
-		if err == nil {
-			return path, nil
-		}
-	}
-	return "", errors.New("python executable not found")
-}
-
-func findImageOCRScript() (string, error) {
-	candidates := []string{
-		"image_ocr.py",
-		filepath.Join("backend", "image_ocr.py"),
-	}
-	for _, candidate := range candidates {
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate, nil
-		}
-	}
-	return "", errors.New("image_ocr.py not found")
 }
 
 func loadChatImageAttachmentsForPrompt(ctx context.Context, userID, sessionID string, attachmentIDs []string, overrides []ChatAttachmentOverride) ([]chatImageAttachmentRecord, error) {

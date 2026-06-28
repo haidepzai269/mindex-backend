@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"mindex-backend/config"
@@ -25,6 +26,7 @@ type AIResponseLogEntry struct {
 	LatencyMs    int
 	TokenCount   int
 	SourcesCount int
+	RichContent  json.RawMessage
 }
 
 
@@ -54,15 +56,19 @@ func SaveAIResponseLog(entry AIResponseLogEntry) string {
 // SaveAIResponseLogWithID ghi log vào DB dùng UUID được tạo sẵn.
 // Dùng khi cần biết log_id trước khi ghi DB (ví dụ: gửi log_id trong SSE event done)
 func SaveAIResponseLogWithID(entry AIResponseLogEntry) {
+	var richContent interface{}
+	if len(entry.RichContent) > 0 {
+		richContent = string(entry.RichContent)
+	}
 	_, err := config.DB.Exec(context.Background(), `
-		INSERT INTO ai_response_logs 
-		  (id, session_id, user_id, document_id, collection_id, question, answer, model_used, latency_ms, token_count, sources_count)
-		VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), $6, $7, $8, $9, $10, $11)
+		INSERT INTO ai_response_logs
+		  (id, session_id, user_id, document_id, collection_id, question, answer, model_used, latency_ms, token_count, sources_count, rich_content)
+		VALUES ($1, $2, $3, NULLIF($4,''), NULLIF($5,''), $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (id) DO NOTHING`,
 		entry.ID,
 		entry.SessionID, entry.UserID, entry.DocumentID, entry.CollectionID,
 		entry.Question, entry.Answer, entry.ModelUsed, entry.LatencyMs,
-		entry.TokenCount, entry.SourcesCount,
+		entry.TokenCount, entry.SourcesCount, richContent,
 	)
 	if err != nil {
 		log.Printf("❌ [AILog] Failed to save AI response log (id=%s): %v", entry.ID, err)

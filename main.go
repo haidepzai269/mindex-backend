@@ -6,6 +6,7 @@ import (
 	"mindex-backend/config"
 	"mindex-backend/internal/persona"
 	"mindex-backend/internal/startup"
+	"mindex-backend/internal/tools"
 	"mindex-backend/internal/ws"
 	"mindex-backend/middleware"
 	"mindex-backend/routes"
@@ -43,6 +44,9 @@ func main() {
 
 	// 2b. Init AI Orchestrator
 	utils.InitOrchestrator()
+
+	// 2c. Init AI Tool Framework registry (calculator, web_search, rag_search, echo)
+	tools.Init()
 
 	// 3. Connect DB & Redis
 	config.ConnectDB()
@@ -117,6 +121,12 @@ func main() {
 		}
 	}()
 
+	// 3d. Init Processing Client
+	if config.RedisClient == nil {
+		log.Fatal("Processing client requires Redis connection")
+	}
+	utils.InitProcessingClient(config.RedisClient, config.Env.ProcessingServiceURL)
+
 	// 4. Khởi chạy Background Workers
 	workers.StartWorkerPool()
 	workers.StartSweeper()             // Chạy ngầm dọn dẹp lúc 3AM
@@ -173,6 +183,7 @@ func main() {
 		routes.RegisterGamificationRoutes(api) // Badges + Streaks
 		routes.RegisterProfileRoutes(api)      // Public Profiles
 		routes.RegisterDashboardRoutes(api)    // User Dashboard
+		routes.RegisterToolRoutes(api)         // AI Tool Endpoints (news pagination)
 	}
 
 	// 8. Start server

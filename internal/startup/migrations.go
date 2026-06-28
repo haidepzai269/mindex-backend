@@ -317,6 +317,49 @@ func startupMigrations() []startupMigration {
 				END IF;
 			END $$;
 		`},
+		{"tool_calls", `
+				CREATE TABLE IF NOT EXISTS tool_calls (
+					id BIGSERIAL PRIMARY KEY,
+					tool_name TEXT NOT NULL,
+					user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+					session_id TEXT,
+					input JSONB NOT NULL,
+					output JSONB,
+					duration_ms INTEGER NOT NULL,
+					status TEXT NOT NULL,
+					error_message TEXT,
+					created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+					CONSTRAINT tool_calls_status_check CHECK (status IN ('success', 'error', 'timeout'))
+				);
+				CREATE INDEX IF NOT EXISTS idx_tool_calls_user_created ON tool_calls(user_id, created_at);
+				CREATE INDEX IF NOT EXISTS idx_tool_calls_name_created ON tool_calls(tool_name, created_at);
+			`},
+		{"user_memory", `
+				CREATE TABLE IF NOT EXISTS user_memory (
+					id BIGSERIAL PRIMARY KEY,
+					user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+					content TEXT NOT NULL,
+					source TEXT NOT NULL DEFAULT 'ai_decided',
+					importance_score SMALLINT NOT NULL DEFAULT 5,
+					created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+					updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+					CONSTRAINT user_memory_source_check CHECK (source IN ('ai_decided', 'user_requested')),
+					CONSTRAINT user_memory_importance_check CHECK (importance_score BETWEEN 1 AND 10)
+				);
+				CREATE INDEX IF NOT EXISTS idx_user_memory_user ON user_memory(user_id, importance_score DESC, created_at DESC);
+			`},
+		{"rich_content and token_usage_logs constraint", `
+			ALTER TABLE ai_response_logs ADD COLUMN IF NOT EXISTS rich_content JSONB DEFAULT NULL;
+
+			DO $$
+			BEGIN
+				IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'token_usage_logs_service_check') THEN
+					ALTER TABLE token_usage_logs DROP CONSTRAINT token_usage_logs_service_check;
+				END IF;
+				ALTER TABLE token_usage_logs ADD CONSTRAINT token_usage_logs_service_check
+					CHECK (service IN ('groq', 'gemini', 'huggingface', 'gemini_embed', 'cerebras', 'mistral', 'openrouter', 'ninerouter', 'tool_dispatcher'));
+			END $$;
+		`},
 		{"study_presentations", `
 			CREATE TABLE IF NOT EXISTS study_presentations (
 				id UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -54,3 +54,32 @@ func SendOTPEmail(to, code, action string) error {
 
 	return SendEmail(to, subject, body)
 }
+
+// SendFeedbackEmail gửi email góp ý tới admin với Reply-To là email user
+func SendFeedbackEmail(adminEmail, replyToEmail, replyToName, subject, htmlBody string) error {
+	if config.Env.SMTPHost == "" || config.Env.SMTPUser == "" {
+		log.Println("⚠️ Cảnh báo: SMTP chưa được cấu hình. Không thể gửi email.")
+		fmt.Printf("\n--- [DEV MAIL SIMULATION] ---\nTo: %s\nReply-To: %s <%s>\nSubject: %s\nBody: %s\n-----------------------------\n\n",
+			adminEmail, replyToName, replyToEmail, subject, htmlBody)
+		return nil
+	}
+
+	auth := smtp.PlainAuth("", config.Env.SMTPUser, config.Env.SMTPPass, config.Env.SMTPHost)
+
+	mime := "MIME-version: 1.0;\nContent-Type: text/html; charset=\"UTF-8\";\n\n"
+	msg := []byte(fmt.Sprintf(
+		"From: %s\nTo: %s\nReply-To: %s <%s>\nSubject: %s\n%s%s",
+		config.Env.SMTPFrom, adminEmail, replyToName, replyToEmail, subject, mime, htmlBody,
+	))
+
+	addr := fmt.Sprintf("%s:%s", config.Env.SMTPHost, config.Env.SMTPPort)
+
+	err := smtp.SendMail(addr, auth, config.Env.SMTPUser, []string{adminEmail}, msg)
+	if err != nil {
+		log.Printf("❌ Lỗi gửi feedback email: %v", err)
+		return err
+	}
+
+	log.Printf("✅ Đã gửi feedback email tới %s (Reply-To: %s)", adminEmail, replyToEmail)
+	return nil
+}

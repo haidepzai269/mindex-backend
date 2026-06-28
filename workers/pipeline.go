@@ -16,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const maxConcurrentEmbeds = 3
@@ -64,7 +66,11 @@ func RunEmbeddingPipeline(job models.UploadJob) error {
 	log.Printf("[Upload Pipeline] Read file for doc %s: %d bytes", job.DocID, len(fileBytes))
 
 	utils.UpdateDocProgressDetail(job.DocID, "extracting", 30, "Đang trích xuất nội dung", "")
-	chunks, err := utils.ExtractAndChunk(localPath, utils.CleanTextLocal)
+	fileExt := filepath.Ext(localPath)
+	if fileExt == "" {
+		fileExt = filepath.Ext(job.CloudinaryURL)
+	}
+	chunks, err := utils.ExtractAndChunk(job.CloudinaryURL, fileExt, utils.CleanTextLocal)
 	if err != nil {
 		utils.UpdateDocProgressDetail(job.DocID, "error", 0, "Không thể trích xuất nội dung", "EXTRACTION_FAILED")
 		return &PipelineError{Code: "EXTRACTION_FAILED", Message: "Không thể trích xuất nội dung", Retryable: false, Err: err}
@@ -73,8 +79,16 @@ func RunEmbeddingPipeline(job models.UploadJob) error {
 	if len(job.ImagePaths) > 0 {
 		utils.UpdateDocProgressDetail(job.DocID, "extracting", 33, "Đang OCR ảnh đính kèm", "")
 		for i, imgPath := range job.ImagePaths {
-			result, ocrErr := utils.RunImageOCR(imgPath)
+			imgPublicID := fmt.Sprintf("mindex_ocr_tmp/%s/%s", job.UserID, uuid.New().String())
+			imgUpload, uploadErr := utils.UploadImageToCloudinary(imgPath, imgPublicID)
 			_ = os.Remove(imgPath)
+			if uploadErr != nil {
+				log.Printf("[Upload Pipeline] Image upload failed for image %d of doc %s: %v", i+1, job.DocID, uploadErr)
+				continue
+			}
+
+			result, ocrErr := utils.RunImageOCR(imgUpload.SecureURL)
+			_ = utils.DestroyImageFromCloudinary(imgUpload.PublicID)
 			if ocrErr != nil {
 				log.Printf("[Upload Pipeline] OCR failed for image %d of doc %s: %v", i+1, job.DocID, ocrErr)
 				continue

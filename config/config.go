@@ -53,6 +53,14 @@ type AppConfig struct {
 	ExaMonthlySafe         int
 	GoogleCSEMonthlySafe   int
 	GoogleCSEDailySafe     int
+	ProcessingServiceURL   string
+	E2BAPIKey              string
+	OpenWeatherMapAPIKey   string
+	WeatherAPIKey          string
+	NewsDataAPIKey         string
+	GNewsAPIKey            string
+	CoinGeckoAPIKey        string
+	WorldNewsAPIKey        string
 }
 
 var Env AppConfig
@@ -270,5 +278,18 @@ func LoadConfig() {
 		ExaMonthlySafe:         envInt("EXA_MONTHLY_SAFE", 880),
 		GoogleCSEMonthlySafe:   envInt("GOOGLE_CSE_MONTHLY_SAFE", 2700),
 		GoogleCSEDailySafe:     envInt("GOOGLE_CSE_DAILY_SAFE", 88),
+		ProcessingServiceURL: func() string {
+			if u := os.Getenv("PROCESSING_SERVICE_URL"); u != "" {
+				return u
+			}
+			return "http://localhost:8000"
+		}(),
+		E2BAPIKey:            strings.TrimSpace(os.Getenv("E2B_API_KEY")),
+		OpenWeatherMapAPIKey: strings.TrimSpace(os.Getenv("OPENWEATHERMAP_API_KEY")),
+		WeatherAPIKey:        strings.TrimSpace(os.Getenv("WEATHERAPI_KEY")),
+		NewsDataAPIKey:       strings.TrimSpace(os.Getenv("NEWSDATA_API_KEY")),
+		GNewsAPIKey:          strings.TrimSpace(os.Getenv("GNEWS_API_KEY")),
+		CoinGeckoAPIKey:      strings.TrimSpace(os.Getenv("COINGECKO_API_KEY")),
+		WorldNewsAPIKey:      strings.TrimSpace(os.Getenv("WORLDNEWS_API_KEY")),
 	}
 }

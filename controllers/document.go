@@ -119,9 +119,12 @@ func GetDocumentDetail(c *gin.Context) {
 		if err == nil && sharedDocID == docID && allowFork {
 			if expiredAt == nil || time.Now().Before(*expiredAt) {
 				// Auto-insert vào document_references cho user hiện tại
+				// Chỉ insert nếu document chưa bị soft-delete, tránh hồi sinh reference cho tài liệu đã xóa.
 				_, err = config.DB.Exec(config.Ctx, `
-					INSERT INTO document_references (user_id, document_id) 
-					VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, docID)
+					INSERT INTO document_references (user_id, document_id)
+					SELECT $1, $2 WHERE EXISTS (
+						SELECT 1 FROM documents WHERE id = $2 AND deleted_at IS NULL
+					) ON CONFLICT DO NOTHING`, userID, docID)
 				if err != nil {
 					log.Printf("⚠️ [FORK] Lỗi auto-reference cho user %s, doc %s: %v", userID, docID, err)
 				} else {
@@ -218,15 +221,22 @@ func TogglePinDocument(c *gin.Context) {
 	}
 
 	// 2. Cập nhật trạng thái Ghim trong references (Sử dụng UPSERT để đảm bảo)
-	_, err := config.DB.Exec(config.Ctx, `
+	// Chỉ cho phép upsert nếu document chưa bị soft-delete, tránh hồi sinh reference cho tài liệu đã xóa.
+	tag, err := config.DB.Exec(config.Ctx, `
 		INSERT INTO document_references (user_id, document_id, pinned)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (user_id, document_id) 
+		SELECT $1, $2, $3 WHERE EXISTS (
+			SELECT 1 FROM documents WHERE id = $2 AND deleted_at IS NULL
+		)
+		ON CONFLICT (user_id, document_id)
 		DO UPDATE SET pinned = EXCLUDED.pinned`,
 		userID, docID, req.Pinned,
 	)
 	if err != nil {
 		c.JSON(500, gin.H{"success": false, "message": "Không thể cập nhật trạng thái ghim"})
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		c.JSON(404, gin.H{"success": false, "message": "Tài liệu không tồn tại hoặc đã bị xóa"})
 		return
 	}
 
@@ -312,7 +322,7 @@ func DeleteDocument(c *gin.Context) {
 		// Sweeper sẽ hard-delete sau 7 ngày và dọn Cloudinary lúc đó.
 		// expired_at = NOW() ẩn khỏi community/search queries mà không cần sửa từng query.
 		_, err = config.DB.Exec(config.Ctx,
-			`UPDATE documents SET deleted_at = NOW(), expired_at = NOW() WHERE id = $1`, docID)
+			`UPDATE documents SET deleted_at = NOW(), expired_at = NOW(), expiration_notified = TRUE WHERE id = $1`, docID)
 		if err != nil {
 			log.Printf("[Cleanup] Soft-delete failed for document %s: %v", docID, err)
 		} else {

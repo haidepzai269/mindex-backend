@@ -3,7 +3,7 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
-	"os/exec"
+	"time"
 )
 
 type OCRResult struct {
@@ -21,28 +21,23 @@ type OCRBlock struct {
 	H          float64 `json:"h"`
 }
 
-func RunImageOCR(imagePath string) (*OCRResult, error) {
-	commands := []string{"py", "python", "python3"}
-	var out []byte
-	var err error
-
-	for _, pyCmd := range commands {
-		cmd := exec.Command(pyCmd, "image_ocr.py", imagePath)
-		out, err = cmd.Output()
-		if err == nil {
-			break
-		}
-		if _, isExitError := err.(*exec.ExitError); isExitError {
-			break
-		}
+func RunImageOCR(imageURL string) (*OCRResult, error) {
+	if Processing == nil {
+		return nil, fmt.Errorf("processing client not initialized")
 	}
+
+	payload := map[string]any{
+		"image_url": imageURL,
+	}
+
+	raw, err := Processing.CallAsync("ocr", payload, 45*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("OCR script failed: %w", err)
+		return nil, fmt.Errorf("processing service OCR failed: %w", err)
 	}
 
 	var result OCRResult
-	if err := json.Unmarshal(out, &result); err != nil {
-		return nil, fmt.Errorf("OCR output parse error: %w", err)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("parse OCR result: %w", err)
 	}
 	return &result, nil
 }

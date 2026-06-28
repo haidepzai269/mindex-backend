@@ -168,3 +168,105 @@ func ChatOpenAINonStream(cfg AIProviderConfig, messages []ChatMessage) (string, 
 	}
 	return "", nil
 }
+
+// ChatOpenAINonStreamWithTools mirrors ChatOpenAINonStream but additionally
+// sends tool schemas and parses tool_calls from the response, for the AI
+// Tool Framework's function-calling loop. Kept as a separate function (not
+// a modification of ChatOpenAINonStream) so every existing call site of the
+// non-tool adapter is byte-for-byte unaffected.
+func ChatOpenAINonStreamWithTools(cfg AIProviderConfig, messages []ChatMessage, toolSchemas []ToolSchema) (string, []ToolCallRequest, error) {
+	sanitizedMessages := make([]ChatMessage, len(messages))
+	for i, m := range messages {
+		sanitizedMessages[i] = ChatMessage{
+			Role:       m.Role,
+			Content:    strings.ToValidUTF8(m.Content, ""),
+			ToolCallID: m.ToolCallID,
+			ToolCalls:  m.ToolCalls,
+		}
+	}
+
+	reqBody := map[string]interface{}{
+		"model":    cfg.Model,
+		"messages": sanitizedMessages,
+		"stream":   false,
+	}
+	if len(toolSchemas) > 0 {
+		wireTools := make([]map[string]interface{}, 0, len(toolSchemas))
+		for _, ts := range toolSchemas {
+			wireTools = append(wireTools, map[string]interface{}{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":        ts.Name,
+					"description": ts.Description,
+					"parameters":  ts.Parameters,
+				},
+			})
+		}
+		reqBody["tools"] = wireTools
+		reqBody["tool_choice"] = "auto"
+	}
+
+	jsonBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", nil, fmt.Errorf("lỗi đóng gói JSON cho %s: %v", cfg.Type, err)
+	}
+
+	key, alias := cfg.Pool.GetKey()
+	if key == "" {
+		return "", nil, fmt.Errorf("không có API Key cho pool %s", cfg.Type)
+	}
+
+	apiURL := fmt.Sprintf("%s/chat/completions", strings.TrimSuffix(cfg.BaseURL, "/"))
+	req, _ := http.NewRequest("POST", apiURL, bytes.NewBuffer(jsonBytes))
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+
+	log.Printf("🛠️ %s Non-Stream (tools=%d): Sử dụng %s cho model %s", cfg.Type, len(toolSchemas), alias, cfg.Model)
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", nil, fmt.Errorf("%s API failed with status %s", cfg.Type, resp.Status)
+	}
+
+	UpdateKeyStatusFromHeaders(string(cfg.Type), alias, key, resp.Header)
+
+	var res struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					ID       string `json:"id"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", nil, err
+	}
+
+	if len(res.Choices) == 0 {
+		return "", nil, nil
+	}
+
+	msg := res.Choices[0].Message
+	var calls []ToolCallRequest
+	for _, tc := range msg.ToolCalls {
+		calls = append(calls, ToolCallRequest{
+			ID:        tc.ID,
+			Name:      tc.Function.Name,
+			Arguments: tc.Function.Arguments,
+		})
+	}
+	return msg.Content, calls, nil
+}

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"os/exec"
 	"strings"
 	"time"
 )
@@ -32,10 +31,8 @@ const (
 	MinHeadingsRequired = 2
 )
 
-// ExtractAndChunk process the document into chunks.
-// Replaces SplitIntoChunks for documents.
-func ExtractAndChunk(filePath string, cleanTextFunc func(string) string) ([]Chunk, error) {
-	blocks, err := extractBlocks(filePath)
+func ExtractAndChunk(fileURL string, fileExtension string, cleanTextFunc func(string) string) ([]Chunk, error) {
+	blocks, err := extractBlocks(fileURL, fileExtension)
 	if err != nil {
 		return nil, fmt.Errorf("extraction error: %v", err)
 	}
@@ -57,47 +54,29 @@ func ExtractAndChunk(filePath string, cleanTextFunc func(string) string) ([]Chun
 	return buildChunks(blocks), nil
 }
 
-func extractBlocks(filePath string) ([]Block, error) {
-	commands := []string{"py", "python", "python3"}
-	var out []byte
-	var err error
-	var success bool
-
-	var pythonErrorResponse struct {
-		Error string `json:"error"`
+func extractBlocks(fileURL string, fileExtension string) ([]Block, error) {
+	if Processing == nil {
+		return nil, fmt.Errorf("processing client not initialized")
 	}
 
-	for _, pyCmd := range commands {
-		cmd := exec.Command(pyCmd, "extractor.py", filePath)
-		out, err = cmd.CombinedOutput()
-		if err == nil {
-			success = true
-			break
-		}
-		if _, isExitError := err.(*exec.ExitError); isExitError {
-			// Lệnh python được tìm thấy nhưng script chạy lỗi, không cần thử lệnh python khác
-			break
-		}
+	payload := map[string]any{
+		"file_url":       fileURL,
+		"file_extension": fileExtension,
 	}
 
-	if !success {
-		if strings.Contains(string(out), "\"error\":") {
-			json.Unmarshal(out, &pythonErrorResponse)
-			if pythonErrorResponse.Error != "" {
-				return nil, fmt.Errorf("python script error: %s", pythonErrorResponse.Error)
-			}
-		}
-		return nil, fmt.Errorf("failed to run extractor script: %v. Output: %s", err, string(out))
-	}
-
-	var blocks []Block
-
-	err = json.Unmarshal(out, &blocks)
+	raw, err := Processing.CallAsync("extract", payload, 120*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("malformed JSON from extractor: %v. Output snippet: %s", err, string(out[:min(len(out), 200)]))
+		return nil, fmt.Errorf("processing service extract failed: %w", err)
 	}
 
-	return blocks, nil
+	var result struct {
+		Blocks []Block `json:"blocks"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("parse extract result: %w", err)
+	}
+
+	return result.Blocks, nil
 }
 
 func buildChunks(blocks []Block) []Chunk {

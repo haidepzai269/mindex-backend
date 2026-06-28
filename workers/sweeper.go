@@ -100,6 +100,8 @@ func RunSweeperNow() (map[string]interface{}, error) {
 		return nil, err
 	}
 
+	expiredVideoCount := sweepExpiredVideoAttachments()
+
 	// Hard-delete các tài liệu soft-deleted sau 7 ngày, kèm dọn Cloudinary
 	resSoftDel, softDelDocs := sweepSoftDeletedDocuments()
 	_ = resSoftDel
@@ -130,14 +132,15 @@ func RunSweeperNow() (map[string]interface{}, error) {
 		}
 	}()
 
-	log.Printf("🧹 [Sweeper] Đã dọn dẹp %d private docs, %d public docs, %d soft-deleted docs",
-		privCount, pubCount, len(softDelDocs))
+	log.Printf("🧹 [Sweeper] Đã dọn dẹp %d private docs, %d public docs, %d soft-deleted docs, %d expired video attachments",
+		privCount, pubCount, len(softDelDocs), expiredVideoCount)
 
 	return map[string]interface{}{
-		"deleted_private": privCount,
-		"deleted_public":  pubCount,
-		"retention":       retentionStats,
-		"duration_ms":     time.Since(start).Milliseconds(),
+		"deleted_private":        privCount,
+		"deleted_public":         pubCount,
+		"expired_video_attachments": expiredVideoCount,
+		"retention":              retentionStats,
+		"duration_ms":            time.Since(start).Milliseconds(),
 	}, nil
 }
 
@@ -192,6 +195,58 @@ func sweepSoftDeletedDocuments() (int64, []softDelDoc) {
 	}()
 
 	return res.RowsAffected(), docs
+}
+
+func sweepExpiredVideoAttachments() int64 {
+	rows, err := config.DB.Query(config.Ctx, `
+		SELECT id, storage_public_id FROM chat_video_attachments
+		WHERE (expires_at IS NOT NULL AND expires_at < NOW() AND status != 'processing')
+		   OR (status = 'error' AND created_at < NOW() - INTERVAL '10 minutes')`)
+	if err != nil {
+		log.Printf("[Sweeper] video attachments query failed: %v", err)
+		return 0
+	}
+	defer rows.Close()
+
+	type vidAttach struct {
+		ID       string
+		PublicID string
+	}
+	var attachments []vidAttach
+	for rows.Next() {
+		var v vidAttach
+		if rows.Scan(&v.ID, &v.PublicID) == nil {
+			attachments = append(attachments, v)
+		}
+	}
+
+	if len(attachments) == 0 {
+		return 0
+	}
+
+	ids := make([]string, len(attachments))
+	for i, v := range attachments {
+		ids[i] = v.ID
+	}
+
+	res, err := config.DB.Exec(config.Ctx,
+		`DELETE FROM chat_video_attachments WHERE id = ANY($1::uuid[])`, ids)
+	if err != nil {
+		log.Printf("[Sweeper] video attachments delete failed: %v", err)
+		return 0
+	}
+
+	go func() {
+		for _, v := range attachments {
+			if v.PublicID != "" {
+				if err := utils.DestroyVideoFromCloudinary(v.PublicID); err != nil {
+					log.Printf("[Sweeper] Cloudinary video cleanup failed for %s: %v", v.ID, err)
+				}
+			}
+		}
+	}()
+
+	return res.RowsAffected()
 }
 
 func runRetentionCleanup() map[string]int64 {

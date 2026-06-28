@@ -17,6 +17,28 @@ import (
 type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// ToolCallID and ToolCalls are additive fields for the AI Tool Framework's
+	// function-calling loop (role="tool" results / role="assistant" requests).
+	// Always empty/nil for existing non-tool call sites, so wire format is
+	// byte-for-byte identical to before when unused (omitempty).
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []ToolCallRequest `json:"tool_calls,omitempty"`
+}
+
+// ToolSchema describes one callable tool to the LLM, in a minimal
+// JSON-Schema-shaped form shared by all OpenAI-compatible providers.
+type ToolSchema struct {
+	Name        string
+	Description string
+	Parameters  map[string]interface{}
+}
+
+// ToolCallRequest is a tool invocation the LLM asked for, parsed from an
+// OpenAI-compatible "tool_calls" response field.
+type ToolCallRequest struct {
+	ID        string `json:"id"`
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type GroqRequest struct {

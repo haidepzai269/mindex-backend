@@ -500,10 +500,10 @@ func UseCommunityDocument(c *gin.Context) {
 	docID := c.Param("id")
 	userID := c.GetString("user_id")
 
-	// Kiểm tra tài liệu tồn tại và là public
+	// Kiểm tra tài liệu tồn tại, sẵn sàng và chưa bị soft-delete
 	var exists bool
 	err := config.DB.QueryRow(config.Ctx,
-		`SELECT EXISTS(SELECT 1 FROM documents WHERE id=$1 AND status='ready')`,
+		`SELECT EXISTS(SELECT 1 FROM documents WHERE id=$1 AND status='ready' AND deleted_at IS NULL)`,
 		docID).Scan(&exists)
 	if err != nil || !exists {
 		c.JSON(404, gin.H{"success": false, "error": "DOCUMENT_NOT_FOUND", "message": "Tài liệu không tồn tại hoặc chưa sẵn sàng"})

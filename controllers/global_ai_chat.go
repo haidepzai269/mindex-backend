@@ -7,6 +7,7 @@ import (
 	"log"
 	"mindex-backend/config"
 	"mindex-backend/internal/persona"
+	"mindex-backend/internal/tools"
 	"mindex-backend/utils"
 	"net/http"
 	"strings"
@@ -19,10 +20,11 @@ import (
 const globalAIChatScope = "global_ai"
 
 type GlobalAIChatRequest struct {
-	SessionID string `json:"session_id"`
-	Question  string `json:"question" binding:"required"`
-	Model     string `json:"model"`
-	Thinking  bool   `json:"thinking"`
+	SessionID         string `json:"session_id"`
+	Question          string `json:"question" binding:"required"`
+	Model             string `json:"model"`
+	Thinking          bool   `json:"thinking"`
+	VideoAttachmentID string `json:"video_attachment_id"`
 }
 
 func CreateGlobalAISession(c *gin.Context) {
@@ -224,6 +226,26 @@ func GlobalAIMessage(c *gin.Context) {
 		"content":   req.Question,
 		"timestamp": time.Now().Format(time.RFC3339),
 	}
+	if req.VideoAttachmentID != "" {
+		var storageURL, originalName, videoMimeType string
+		var durationSec int
+		var sizeBytes int64
+		if err := config.DB.QueryRow(config.Ctx, `
+			SELECT COALESCE(storage_url, ''), original_name, mime_type, duration_seconds, size_bytes
+			FROM chat_video_attachments
+			WHERE id = $1 AND user_id = $2`,
+			req.VideoAttachmentID, userID).Scan(&storageURL, &originalName, &videoMimeType, &durationSec, &sizeBytes); err == nil {
+			userMsg["attachments"] = []gin.H{{
+				"id":               req.VideoAttachmentID,
+				"url":              storageURL,
+				"filename":         originalName,
+				"mime_type":        videoMimeType,
+				"size_bytes":       sizeBytes,
+				"type":             "video",
+				"duration_seconds": durationSec,
+			}}
+		}
+	}
 	userMsgBytes, _ := json.Marshal(userMsg)
 	if err := appendChatHistoryMessage(config.Ctx, req.SessionID, string(userMsgBytes)); err != nil {
 		log.Printf("[GLOBAL_AI] Failed to save user message: %v", err)
@@ -327,7 +349,8 @@ func GlobalAIMessage(c *gin.Context) {
 	}
 	var webSearchUsed bool
 	var webSearchMeta gin.H
-	if config.Env.WebSearchEnabled {
+	isToolQuery := isToolDomainQuery(req.Question)
+	if config.Env.WebSearchEnabled && !isToolQuery {
 		webPlan := utils.DecideWebSearch(req.Question, searchQuery, mindexContext, "", userPersona, userTier, thinkingMode)
 		if !hasMindexContext {
 			webPlan.UseWebSearch = true
@@ -381,6 +404,12 @@ func GlobalAIMessage(c *gin.Context) {
 				}
 			}
 		}
+	} else if isToolQuery {
+		webSearchMeta = gin.H{
+			"used":   false,
+			"reason": "skipped: tool domain query (crypto/news/weather)",
+		}
+		writeChatInsight(c, flusher, "Câu hỏi thuộc domain realtime tool, bỏ qua web search để ưu tiên tool dispatcher.")
 	} else if req.Thinking || !hasMindexContext {
 		webSearchMeta = gin.H{
 			"requested": req.Thinking,
@@ -398,21 +427,41 @@ func GlobalAIMessage(c *gin.Context) {
 User đã bật chế độ Thinking cho câu hỏi này. Hãy phân tích kỹ hơn, kiểm tra mâu thuẫn giữa các nguồn, và trả lời có cấu trúc rõ ràng. Không bịa nguồn.`
 	}
 
-	// Short-circuit: không có Mindex context và web search cũng không có kết quả → bỏ qua AI call
-	if !hasMindexContext && !webSearchUsed {
-		log.Printf("⚡ [GLOBAL_AI] No context (mindex=false, web=false) for session=%s, short-circuiting AI call", req.SessionID)
+	var videoContext string
+	if req.VideoAttachmentID != "" {
+		videoCtxText, err := loadChatVideoAttachmentForPrompt(userID, req.SessionID, req.VideoAttachmentID)
+		if err != nil {
+			log.Printf("[GLOBAL_AI] Video context load failed id=%s: %v", req.VideoAttachmentID, err)
+		} else {
+			videoContext = buildChatVideoContext(videoCtxText)
+			if videoContext != "" {
+				writeChatInsight(c, flusher, "Đã tải ngữ cảnh phân tích video vào prompt.")
+			}
+		}
+	}
+	hasVideoContext := videoContext != ""
+
+	// Short-circuit: không có context nào → bỏ qua AI call
+	// Ngoại trừ tool domain queries (crypto, news, weather) — tool dispatcher sẽ xử lý
+	if !hasMindexContext && !webSearchUsed && !hasVideoContext && !isToolQuery {
+		log.Printf("⚡ [GLOBAL_AI] No context (mindex=false, web=false, video=false) for session=%s, short-circuiting AI call", req.SessionID)
 		noContextMsg := "Xin lỗi, tôi không tìm thấy thông tin phù hợp trong Thư viện chung Mindex. Hãy thử hỏi về chủ đề khác hoặc tìm kiếm bằng từ khóa cụ thể hơn."
 		sendHardcodedSSEResponse(c, flusher, req.SessionID, noContextMsg)
-		go persistGlobalAIConversation(req.SessionID, req.Question, noContextMsg, nil, "", userTier)
+		go persistGlobalAIConversation(req.SessionID, req.Question, noContextMsg, nil, "", userTier, nil /*richContents*/)
 		return
 	}
 
-	if !hasMindexContext {
+	if !hasMindexContext && !hasVideoContext {
 		systemPrompt += `
 
 [MINDEX SOURCE STATUS]
 Không tìm thấy nguồn phù hợp trong Thư viện chung Mindex cho câu hỏi này. Nếu dùng kiến thức model hoặc nguồn web, hãy nói rõ: "không tìm thấy nguồn phù hợp trong Thư viện chung Mindex". Không gán nguồn Mindex cho thông tin không có trong context.`
 	}
+
+	if hasVideoContext {
+		contextText = videoContext + "\n" + contextText
+	}
+
 	if strings.TrimSpace(contextText) == "" {
 		contextText = "Không có nguồn Thư viện chung Mindex phù hợp và không có web context khả dụng."
 	}
@@ -424,8 +473,37 @@ Không tìm thấy nguồn phù hợp trong Thư viện chung Mindex cho câu h�
 	}
 
 	writeChatInsight(c, flusher, "Đang gửi prompt đã dựng sang AI Orchestrator để bắt đầu sinh câu trả lời.")
+	sendToolStatusHints(c, flusher, req.Question)
 	chatStart := time.Now()
-	fullAnswer, usedProvider, streamErr := utils.AI.ChatStream(utils.ServiceChat, c, messages, req.Model)
+
+	// AI Tool Framework (spec 008): let the model call registered tools
+	// (calculator, web_search, rag_search, ...) before producing its final
+	// answer. The dispatcher's loop is non-streaming by nature (it needs the
+	// full response to detect tool_calls), so the final answer is sent as
+	// word-chunked SSE tokens via writeChatTokens instead of true
+	// token-by-token streaming - a known trade-off for this integration.
+	var fullAnswer string
+	var usedProvider utils.ProviderType
+	var streamErr error
+
+	execCtx := tools.ToolExecutionContext{UserID: userID, SessionID: req.SessionID, Tier: userTier}
+	dispatchResult, dispatchErr := tools.NewDispatcher(tools.Default).Run(c.Request.Context(), execCtx, messages, 0)
+
+	switch {
+	case dispatchErr != nil:
+		streamErr = dispatchErr
+	case dispatchResult.Pending != nil:
+		fullAnswer = fmt.Sprintf("Mình cần xác nhận trước khi thực hiện \"%s\". Bạn xác nhận để mình tiếp tục không?", dispatchResult.Pending.ToolName)
+		writeChatTokens(c, flusher, fullAnswer)
+	default:
+		for _, rc := range dispatchResult.RichContents {
+			writeChatRichContent(c, flusher, rc)
+		}
+		fullAnswer = dispatchResult.FinalAnswer
+		usedProvider = "tool_dispatcher"
+		writeChatTokens(c, flusher, fullAnswer)
+	}
+
 	chatLatency := int(time.Since(chatStart).Milliseconds())
 
 	// [Cache Write] Lưu câu trả lời vào cache sau khi AI thành công (async)
@@ -447,6 +525,7 @@ Không tìm thấy nguồn phù hợp trong Thư viện chung Mindex cho câu h�
 			LatencyMs:    chatLatency,
 			TokenCount:   (len(finalPrompt) + len(fullAnswer)) / 4,
 			SourcesCount: len(sources),
+			RichContent:  dispatchResult.RichContent,
 		}
 		go SaveAIResponseLogWithID(entry)
 	}
@@ -487,11 +566,17 @@ Không tìm thấy nguồn phù hợp trong Thư viện chung Mindex cho câu h�
 		"chat_scope":  globalAIChatScope,
 		"mindex_used": hasMindexContext,
 	}
+	if dispatchResult.Pending != nil {
+		donePayload["pending_confirmation"] = gin.H{
+			"pending_id": dispatchResult.Pending.PendingID,
+			"tool_name":  dispatchResult.Pending.ToolName,
+		}
+	}
 	doneBytes, _ := json.Marshal(donePayload)
 	fmt.Fprintf(c.Writer, "event: done\ndata: %s\n\n", string(doneBytes))
 	flusher.Flush()
 
-	persistGlobalAIConversation(req.SessionID, req.Question, fullAnswer, sources, logID, userTier)
+	persistGlobalAIConversation(req.SessionID, req.Question, fullAnswer, sources, logID, userTier, dispatchResult.RichContents)
 }
 
 func isValidGlobalAISession(sessionID string, userID string) bool {
@@ -562,7 +647,37 @@ func tierContextTurns(tier string) int64 {
 	}
 }
 
-func persistGlobalAIConversation(sessionID string, question string, answer string, sources []map[string]interface{}, logID string, userTier string) {
+var toolHintKeywords = map[string][]string{
+	"Đang tra thời tiết...":     {"thời tiết", "nhiệt độ", "weather", "dự báo", "mưa", "nắng", "trời"},
+	"Đang tìm tin tức...":       {"tin tức", "tin hot", "news", "báo", "trending"},
+	"Đang kiểm tra giá coin...": {"giá coin", "crypto", "bitcoin", "btc", "eth", "giá tiền", "tiền điện tử"},
+}
+
+func sendToolStatusHints(c *gin.Context, flusher http.Flusher, question string) {
+	q := strings.ToLower(question)
+	for hint, keywords := range toolHintKeywords {
+		for _, kw := range keywords {
+			if strings.Contains(q, kw) {
+				writeChatInsight(c, flusher, hint)
+				break
+			}
+		}
+	}
+}
+
+func isToolDomainQuery(question string) bool {
+	q := strings.ToLower(question)
+	for _, keywords := range toolHintKeywords {
+		for _, kw := range keywords {
+			if strings.Contains(q, kw) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func persistGlobalAIConversation(sessionID string, question string, answer string, sources []map[string]interface{}, logID string, userTier string, richContents []json.RawMessage) {
 	go func() {
 		contextTurns := tierContextTurns(userTier)
 		if config.RedisClient != nil {
@@ -581,6 +696,9 @@ func persistGlobalAIConversation(sessionID string, question string, answer strin
 			"sources":   sources,
 			"timestamp": time.Now().Format(time.RFC3339),
 			"log_id":    logID,
+		}
+		if len(richContents) > 0 {
+			assistantMsg["rich_contents"] = richContents
 		}
 		asstMsgBytes, _ := json.Marshal(assistantMsg)
 		if err := appendChatHistoryMessage(context.Background(), sessionID, string(asstMsgBytes)); err != nil {
@@ -738,13 +856,19 @@ func ListGlobalAISessions(c *gin.Context) {
 }
 
 func buildGlobalAISystemPrompt() string {
-	return `
+	base := `
 
 [GLOBAL AI CHAT]
 Bạn là Mindex AI Tổng hợp. Bạn trả lời bằng tiếng Việt và có thể tổng hợp kiến thức từ các tài liệu công khai trong Thư viện chung Mindex.
-1. Ưu tiên nguồn Thư viện chung Mindex trong [CONTEXT]. Khi dùng nguồn Mindex, trích dẫn theo tên tài liệu, trang và đoạn/chunk nếu có.
+1. Ưu tiên nguồn Thư viện chung Mindex trong [CONTEXT] cho câu hỏi học tập. Khi dùng nguồn Mindex, trích dẫn theo tên tài liệu, trang và đoạn/chunk nếu có.
 2. Nếu nhiều tài liệu cùng liên quan, hãy tổng hợp điểm đồng thuận và chỉ rõ mâu thuẫn nếu có.
-3. Nếu câu hỏi không có nguồn phù hợp trong Thư viện chung Mindex, bạn được trả lời bằng kiến thức model hoặc web context nếu có, nhưng phải nói rõ "không tìm thấy nguồn phù hợp trong Thư viện chung Mindex".
-4. Không bịa tên tài liệu, trang, chunk, URL hoặc nguồn. Chỉ nêu nguồn xuất hiện trong context.
-5. Nếu context không đủ để kết luận chắc chắn, nói rõ giới hạn và đưa câu trả lời thận trọng.`
+3. NGOẠI LỆ: Câu hỏi về dữ liệu realtime (tin tức, thời tiết, giá coin/crypto) → BẮT BUỘC dùng tool, KHÔNG trả lời từ context hoặc kiến thức model. Xem mục [AVAILABLE TOOLS].
+4. Nếu câu hỏi không có nguồn phù hợp trong Thư viện chung Mindex, bạn được trả lời bằng kiến thức model hoặc web context nếu có, nhưng phải nói rõ "không tìm thấy nguồn phù hợp trong Thư viện chung Mindex".
+5. Không bịa tên tài liệu, trang, chunk, URL hoặc nguồn. Chỉ nêu nguồn xuất hiện trong context.
+6. Nếu context không đủ để kết luận chắc chắn, nói rõ giới hạn và đưa câu trả lời thận trọng.`
+
+	if toolPrompt := tools.BuildToolUsagePrompt(tools.Default); toolPrompt != "" {
+		base += "\n" + toolPrompt
+	}
+	return base
 }
